@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"strings"
 	"time"
@@ -31,7 +30,7 @@ const (
 	EM500_SWL      DeviceModel = "EM500_SWL"
 	KS3000_LORA    DeviceModel = "KS3000_LORA"
 	KS3000_WIFI    DeviceModel = "KS3000_WIFI"
-	WS101_R        DeviceModel = "WS101_R"
+	WS101          DeviceModel = "WS101"
 	DTL200_SWL     DeviceModel = "DTL200_SWL"
 	EM300_DI       DeviceModel = "EM300_DI"
 	NIT21LI_EMW104 DeviceModel = "NIT21LI_EMW104"
@@ -69,7 +68,7 @@ func GetDevicesMap() map[string]DeviceModel {
 		"303331397230790e": KS3000_LORA,
 		"3033313980307b0e": KS3000_LORA,
 		// ── WS101-R (Milesight smart button) ────────────────────────────────
-		"24e124535f318437": WS101_R,
+		"24e124535f318437": WS101,
 		// ── NIT21LI-EMW104 (Khomp weather station, LoRaWAN fPort 4) ─────────
 		"f803320100028a5f": NIT21LI_EMW104,
 		"f803320100030977": NIT21LI_EMW104,
@@ -159,7 +158,38 @@ func writeSensorRecords(ctx context.Context, client *influxdb3.Client, records [
 	if len(points) == 0 {
 		return nil
 	}
-	return client.WritePoints(ctx, points)
+	// NoSync avoids WAL-lock conflicts on InfluxDB3 Core under concurrent writes.
+	// For IoT sensor data losing a point on a hard crash is acceptable.
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := client.WritePoints(ctx, points, influxdb3.WithNoSync(true))
+		if err == nil {
+			return nil
+		}
+		errStr := err.Error()
+		// 4xx errors other than 429 (rate limit) are not recoverable – log & skip.
+		if is4xx(errStr) && !strings.Contains(errStr, "429") {
+			return err
+		}
+		if attempt < maxAttempts {
+			backoff := time.Duration(attempt*attempt) * 250 * time.Millisecond
+			log.Printf("[write] attempt %d/%d failed (%v) – retrying in %v", attempt, maxAttempts, err, backoff)
+			time.Sleep(backoff)
+		} else {
+			return err
+		}
+	}
+	return nil // unreachable
+}
+
+// is4xx reports whether an error string contains an HTTP 4xx status code.
+func is4xx(errStr string) bool {
+	for _, code := range []string{"400", "401", "403", "404", "405", "422"} {
+		if strings.Contains(errStr, code) {
+			return true
+		}
+	}
+	return false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,7 +205,7 @@ func b64ToByte(b64 string) ([]byte, error) {
 // provider == "custom": rawPayload is raw JSON; timestamp comes from the message.
 // LNS providers:        rawPayload is base64-encoded binary; timestamp from LNS frame.
 func parseDeviceModel(ctx context.Context, client *influxdb3.Client,
-	deviceID string, deviceModel DeviceModel, provider, rawPayload string, ts time.Time) {
+	deviceID string, deviceModel DeviceModel, provider, rawPayload string, port uint64, ts time.Time) {
 
 	if rawPayload == "" {
 		log.Printf("[parse] empty payload for deviceID=%s", deviceID)
@@ -202,17 +232,17 @@ func parseDeviceModel(ctx context.Context, client *influxdb3.Client,
 		}
 		switch deviceModel {
 		case NIT21LI_EMW104:
-			records = khomp.DecodeNIT21LI_EMW104(b, deviceID, provider, ts)
+			records = khomp.DecodeNIT21LIEMW104(b, deviceID, provider, ts)
 		case KS3000_LORA:
-			records = kron.DecodeLoRa(b, deviceID, provider, ts)
+			records = kron.DecodeKS300LORA(b, deviceID, provider, ts)
 		case EM300_DI:
 			records = milesight.DecodeEM300DI(b, deviceID, provider, ts)
 		case EM500_SWL:
 			records = milesight.DecodeEM500SWL(b, deviceID, provider, ts)
 		case DTL200_SWL:
-			records = dragino.DecodeDTL200SWL(b, deviceID, provider, ts)
-		case WS101_R:
-			records = milesight.DecodeWS101R(b, deviceID, provider, ts)
+			records = dragino.DecodeDTL200SWL(b, deviceID, provider, port, ts)
+		case WS101:
+			records = milesight.DecodeWS101(b, deviceID, provider, ts)
 		default:
 			log.Printf("[parse] no LNS decoder for device model %s", deviceModel)
 			return
@@ -245,11 +275,12 @@ func parseMsg(ctx context.Context, client *influxdb3.Client, deviceID string, de
 
 	case "custom":
 		// Direct MQTT: raw JSON payload, decoder extracts its own timestamp.
-		parseDeviceModel(ctx, client, deviceID, deviceModel, "custom", message, time.Time{})
+		parseDeviceModel(ctx, client, deviceID, deviceModel, "custom", message, 0, time.Time{})
 
 	case "chirpstackv4":
 		// Minimal parse: only extract data payload and frame timestamp.
 		var msg struct {
+			FPort  uint64 `json:"fPort"`
 			RxInfo []struct {
 				NsTime time.Time `json:"nsTime"`
 			} `json:"rxInfo"`
@@ -263,7 +294,7 @@ func parseMsg(ctx context.Context, client *influxdb3.Client, deviceID string, de
 			log.Printf("[parseMsg/chirpstackv4] no rxInfo for deviceID=%s", deviceID)
 			return
 		}
-		parseDeviceModel(ctx, client, deviceID, deviceModel, "chirpstackv4", msg.Data, msg.RxInfo[0].NsTime)
+		parseDeviceModel(ctx, client, deviceID, deviceModel, "chirpstackv4", msg.Data, msg.FPort, msg.RxInfo[0].NsTime)
 
 	case "everynet":
 		// Everynet compacts whitespace; strip before unmarshalling.
@@ -272,6 +303,7 @@ func parseMsg(ctx context.Context, client *influxdb3.Client, deviceID string, de
 			Params struct {
 				Payload string  `json:"payload"`
 				RxTime  float64 `json:"rx_time"`
+				Port    uint64  `json:"port"`
 			} `json:"params"`
 		}
 		if err := json.Unmarshal([]byte(strings.ReplaceAll(message, " ", "")), &msg); err != nil {
@@ -282,8 +314,19 @@ func parseMsg(ctx context.Context, client *influxdb3.Client, deviceID string, de
 			log.Printf("[parseMsg/everynet] skipping type=%s for deviceID=%s", msg.Type, deviceID)
 			return
 		}
-		ts := time.Unix(0, int64(math.Round(msg.Params.RxTime*1e9))).UTC()
-		parseDeviceModel(ctx, client, deviceID, deviceModel, "everynet", msg.Params.Payload, ts)
+		// rx_time is a Unix float in seconds (e.g. 1774967267.485…).
+		// Convert via integer seconds + fractional nanoseconds to avoid float64
+		// precision loss and to produce time.Now() as a safe fallback.
+		var ts time.Time
+		if msg.Params.RxTime > 0 {
+			sec := int64(msg.Params.RxTime)
+			nsec := int64((msg.Params.RxTime - float64(sec)) * 1e9)
+			ts = time.Unix(sec, nsec).UTC()
+		} else {
+			log.Printf("[parseMsg/everynet] missing rx_time for deviceID=%s, using now", deviceID)
+			ts = time.Now().UTC()
+		}
+		parseDeviceModel(ctx, client, deviceID, deviceModel, "everynet", msg.Params.Payload, msg.Params.Port, ts)
 
 	default:
 		log.Printf("[parseMsg] cannot detect provider for deviceID=%s (%.80s…)", deviceID, message)

@@ -195,13 +195,13 @@ func parseKhompSensors(bytes []byte) (*KhompSensors, error) {
 	return p, nil
 }
 
-// DecodeNIT21LI_EMW104 decodes a Khomp NIT 21LI + EMW104 LoRa payload (fPort 4).
+// DecodeNIT21LIEMW104 decodes a Khomp NIT 21LI + EMW104 LoRa payload (fPort 4).
 // sensor_type values come from record.ST — never hardcoded strings.
-func DecodeNIT21LI_EMW104(payload []byte, deviceID, provider string, ts time.Time) []record.SensorDataRecord {
+func DecodeNIT21LIEMW104(payload []byte, deviceID, provider string, ts time.Time) []record.SensorDataRecord {
 	const dm = "nit21li_emw104"
 	s, err := parseKhompSensors(payload)
 	if err != nil {
-		log.Printf("[khomp] DecodeNIT21LI_EMW104[%s]: %v", deviceID, err)
+		log.Printf("[khomp] DecodeNIT21LIEMW104[%s]: %v", deviceID, err)
 		return nil
 	}
 	st := record.ST
@@ -260,7 +260,7 @@ func DecodeNIT21LI_EMW104(payload []byte, deviceID, provider string, ts time.Tim
 		out = append(out, record.NewFloat(st.SolarRad, dm, deviceID, provider, s.EmwSolarRadiation, ts))
 	}
 	if s.IsEmwAtmPres {
-		out = append(out, record.NewFloat(st.AirPressure, dm, deviceID, provider, s.EmwAtmPres, ts))
+		out = append(out, record.NewFloat(st.AirPress, dm, deviceID, provider, s.EmwAtmPres, ts))
 	}
 	return out
 }
