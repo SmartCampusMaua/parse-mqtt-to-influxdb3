@@ -1,0 +1,52 @@
+services:
+  mosquitto:
+    container_name: mosquitto
+    image: eclipse-mosquitto:2.0.22-openssl
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/etc:/mosquitto/config
+      - ./mosquitto/var/data:/mosquitto/data
+      - ./mosquitto/var/log:/mosquitto/log
+
+  influxdb3-core:
+    image: influxdb:3.9-core
+    restart: unless-stopped
+    ports:
+      - "8181:8181"
+    command:
+      - influxdb3
+      - serve
+      - --node-id=node0
+      - --object-store=file
+      - --data-dir=/var/lib/influxdb3/data
+      - --plugin-dir=/var/lib/influxdb3/plugins
+    volumes:
+      - type: bind
+        source: ~/.influxdb3/data
+        target: /var/lib/influxdb3/data
+      - type: bind
+        source: ~/.influxdb3/plugins
+        target: /var/lib/influxdb3/plugins
+
+  explorer:
+    image: influxdata/influxdb3-ui:1.8.0
+    container_name: influxdb3-explorer
+    restart: unless-stopped
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./config:/app-root/config:ro
+
+  mqtt-to-influxdb3:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - mosquitto
+      - influxdb3-core
+    volumes:
+      - ./devices.json:/etc/mqtt-to-influxdb3/devices.json:ro
