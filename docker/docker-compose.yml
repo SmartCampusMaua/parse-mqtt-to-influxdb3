@@ -41,12 +41,29 @@ services:
 
   mqtt-to-influxdb3:
     build:
-      context: .
+      context: ..
       dockerfile: docker/Dockerfile
     restart: unless-stopped
-    env_file: .env
+    env_file: ../.env
     depends_on:
       - mosquitto
       - influxdb3-core
     volumes:
-      - ./devices.json:/etc/mqtt-to-influxdb3/devices.json:ro
+      - ../devices.json:/etc/mqtt-to-influxdb3/devices.json:ro
+
+  grafana:
+    image: grafana/grafana:12.4
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - influxdb3-core
+
+volumes:
+  grafana_data:

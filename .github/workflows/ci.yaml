@@ -1,4 +1,4 @@
-name: parse-mqtt-to-kafka-workflow
+name: parse-mqtt-to-influxdb3-workflow
 on:
   push:
     branches:
