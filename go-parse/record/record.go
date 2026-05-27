@@ -123,6 +123,8 @@ type SensorTypes struct {
 	PulseState   string // pulse_state
 	PulseCounter string // pulse_counter
 	WaterFlow    string // water_flow         m³  (EM300-DI water mode)
+	WaterConv    string // water_conv         m³/pulse conversion factor (v1.3+)
+	PulseConv    string // pulse_conv         pulse conversion factor (v1.3+)
 
 	// ── Water / soil (EM500-SWL, DTL200-SWL) ─────────────────────────────
 	WaterLevel             string // water_level  m (EM500-SWL) | cm (DTL200 probe 0x00)
@@ -171,6 +173,7 @@ var ST = SensorTypes{
 	EnergySTotal: "energy_s_total", Horimetre: "horimetre",
 	// digital input
 	PulseState: "pulse_state", PulseCounter: "pulse_counter", WaterFlow: "water_flow",
+	WaterConv: "water_conv", PulseConv: "pulse_conv",
 	// water / soil
 	WaterLevel: "water_level", ElectricalConductivity: "electrical_conductivity",
 	// button

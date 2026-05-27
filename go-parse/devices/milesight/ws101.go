@@ -3,7 +3,7 @@ package milesight
 import (
 	"time"
 
-	"github.com/OpenDataTelemetry/device-gateway-mqtt/internal/record"
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
 func decodeWS101(entries []TLV, deviceID, provider string, ts time.Time) []record.SensorDataRecord {

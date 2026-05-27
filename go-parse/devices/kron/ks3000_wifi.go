@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OpenDataTelemetry/device-gateway-mqtt/internal/record"
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
 // ParseKS3000WiFi parses KS3000 WiFi JSON payloads.

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OpenDataTelemetry/device-gateway-mqtt/internal/record"
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
 // message is the minimal Everynet uplink structure (unknown fields ignored).
@@ -38,7 +38,7 @@ func Parse(raw string) (*record.LNSFrame, error) {
 	// to preserve fractional precision without float64 multiplication overflow.
 	var ts time.Time
 	if msg.Params.RxTime > 0 {
-		sec  := int64(msg.Params.RxTime)
+		sec := int64(msg.Params.RxTime)
 		nsec := int64(math.Round((msg.Params.RxTime - float64(sec)) * 1e9))
 		ts = time.Unix(sec, nsec).UTC()
 	} else {

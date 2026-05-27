@@ -7,7 +7,7 @@ import (
 	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/devices/khomp"
 	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/devices/kron"
 	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/devices/milesight"
-	"github.com/OpenDataTelemetry/device-gateway-mqtt/internal/record"
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
 type customParser func(model, submodel, message, deviceID string) []record.SensorDataRecord

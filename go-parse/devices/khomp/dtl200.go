@@ -5,7 +5,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/OpenDataTelemetry/device-gateway-mqtt/internal/record"
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
 // DTL200 fixed hardware parameters.

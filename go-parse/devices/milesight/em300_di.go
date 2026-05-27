@@ -1,9 +1,10 @@
 package milesight
 
 import (
+	"math"
 	"time"
 
-	"github.com/OpenDataTelemetry/device-gateway-mqtt/internal/record"
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
 func decodeEM300DI(entries []TLV, deviceID, provider string, ts time.Time) []record.SensorDataRecord {
@@ -22,6 +23,15 @@ func decodeEM300DI(entries []TLV, deviceID, provider string, ts time.Time) []rec
 			out = append(out, record.NewBool(st.PulseState, dm, deviceID, provider, e.Data[0] == 0x01, ts))
 		case e.Channel == 0x05 && e.Type == 0xC8:
 			out = append(out, record.NewInt(st.PulseCounter, dm, deviceID, provider, int64(le32(e.Data)), ts))
+		// PULSE COUNTER (v1.3+): water_conv(2B)+pulse_conv(2B)+water(4B f32)
+		// pulse_counter = water × pulse_conv / water_conv
+		case e.Channel == 0x05 && e.Type == 0xE1:
+			waterConv := float64(le16(e.Data[0:2])) / 10.0
+			pulseConv := float64(le16(e.Data[2:4])) / 10.0
+			water := f32le(e.Data[4:8])
+			if waterConv > 0 {
+				out = append(out, record.NewInt(st.PulseCounter, dm, deviceID, provider, int64(math.Round(water*pulseConv/waterConv)), ts))
+			}
 		}
 	}
 	return out

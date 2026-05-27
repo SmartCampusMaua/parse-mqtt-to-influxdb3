@@ -23,7 +23,7 @@ import (
 
 	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/providers/chirpstack"
 	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/providers/everynet"
-	"github.com/OpenDataTelemetry/device-gateway-mqtt/internal/record"
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

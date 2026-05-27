@@ -4,7 +4,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/OpenDataTelemetry/device-gateway-mqtt/internal/record"
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
 func decodeEM500SWL(entries []TLV, deviceID, provider string, ts time.Time) []record.SensorDataRecord {

@@ -5,7 +5,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/OpenDataTelemetry/device-gateway-mqtt/internal/record"
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
 // ks3000IDMap maps measurement IDs (1 byte) to sensor_type strings.
