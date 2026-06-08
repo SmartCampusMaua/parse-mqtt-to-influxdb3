@@ -22,7 +22,7 @@ func decodeEM300DI(entries []TLV, deviceID, provider string, ts time.Time) []rec
 		case e.Channel == 0x05 && e.Type == 0x00:
 			out = append(out, record.NewBool(st.PulseState, dm, deviceID, provider, e.Data[0] == 0x01, ts))
 		case e.Channel == 0x05 && e.Type == 0xC8:
-			out = append(out, record.NewInt(st.PulseCounter, dm, deviceID, provider, int64(le32(e.Data)), ts))
+			out = append(out, record.NewInt(st.PulseCount, dm, deviceID, provider, int64(le32(e.Data)), ts))
 		// PULSE COUNTER (v1.3+): water_conv(2B)+pulse_conv(2B)+water(4B f32)
 		// pulse_counter = water × pulse_conv / water_conv
 		case e.Channel == 0x05 && e.Type == 0xE1:
@@ -30,7 +30,7 @@ func decodeEM300DI(entries []TLV, deviceID, provider string, ts time.Time) []rec
 			pulseConv := float64(le16(e.Data[2:4])) / 10.0
 			water := f32le(e.Data[4:8])
 			if waterConv > 0 {
-				out = append(out, record.NewInt(st.PulseCounter, dm, deviceID, provider, int64(math.Round(water*pulseConv/waterConv)), ts))
+				out = append(out, record.NewInt(st.PulseCount, dm, deviceID, provider, int64(math.Round(water*pulseConv/waterConv)), ts))
 			}
 		}
 	}
