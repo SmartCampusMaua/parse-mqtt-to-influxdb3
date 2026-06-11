@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -353,12 +355,43 @@ func detectProvider(message string) string {
 // InfluxDB3 writer
 // ─────────────────────────────────────────────────────────────────────────────
 
+// validateRecord returns an error if the record would produce a malformed or
+// unqueryable point in InfluxDB3.  Checked before building the Point object so
+// bad records are rejected at zero network cost.
+func validateRecord(r record.SensorDataRecord) error {
+	switch {
+	case r.SensorType == "":
+		return fmt.Errorf("empty sensor_type (device_id=%s)", r.DeviceID)
+	case r.DeviceID == "":
+		return fmt.Errorf("empty device_id (sensor_type=%s)", r.SensorType)
+	case r.DeviceModel == "":
+		return fmt.Errorf("empty device_model (device_id=%s, sensor_type=%s)", r.DeviceID, r.SensorType)
+	case r.Timestamp.IsZero():
+		return fmt.Errorf("zero timestamp (device_id=%s, sensor_type=%s)", r.DeviceID, r.SensorType)
+	case r.ValueType != "float" && r.ValueType != "int" && r.ValueType != "bool":
+		return fmt.Errorf("unknown value_type %q (device_id=%s, sensor_type=%s)", r.ValueType, r.DeviceID, r.SensorType)
+	case r.ValueType == "float" && r.ValueFloat == nil:
+		return fmt.Errorf("nil float value (device_id=%s, sensor_type=%s)", r.DeviceID, r.SensorType)
+	case r.ValueType == "float" && r.ValueFloat != nil && (math.IsNaN(*r.ValueFloat) || math.IsInf(*r.ValueFloat, 0)):
+		return fmt.Errorf("non-finite float %v (device_id=%s, sensor_type=%s)", *r.ValueFloat, r.DeviceID, r.SensorType)
+	case r.ValueType == "int" && r.ValueInt == nil:
+		return fmt.Errorf("nil int value (device_id=%s, sensor_type=%s)", r.DeviceID, r.SensorType)
+	case r.ValueType == "bool" && r.ValueBool == nil:
+		return fmt.Errorf("nil bool value (device_id=%s, sensor_type=%s)", r.DeviceID, r.SensorType)
+	}
+	return nil
+}
+
 func writeSensorRecords(ctx context.Context, iot *influxdb3.Client, records []record.SensorDataRecord) error {
 	if len(records) == 0 {
 		return nil
 	}
 	points := make([]*influxdb3.Point, 0, len(records))
 	for _, r := range records {
+		if err := validateRecord(r); err != nil {
+			log.Printf("[validate] dropping record: %v", err)
+			continue
+		}
 		p := influxdb3.NewPointWithMeasurement("sensor_data").
 			SetTag("sensor_type", r.SensorType).
 			SetTag("device_model", r.DeviceModel).
@@ -395,13 +428,36 @@ func writeSensorRecords(ctx context.Context, iot *influxdb3.Client, records []re
 	// NoSync avoids WAL-lock conflicts on InfluxDB3 Core under concurrent writes.
 	// For IoT sensor data losing a point on a hard crash is acceptable.
 	const maxAttempts = 3
+	batchErr := writeWithRetry(ctx, iot, points, maxAttempts)
+	if batchErr == nil {
+		return nil
+	}
+	// Batch failed — fall back to per-point writes so one bad record does not
+	// silently drop all other sensor readings from the same message.
+	log.Printf("[write] batch failed (%v) – retrying %d points individually", batchErr, len(points))
+	var firstErr error
+	for i, pt := range points {
+		if err := writeWithRetry(ctx, iot, []*influxdb3.Point{pt}, maxAttempts); err != nil {
+			log.Printf("[write] point %d/%d failed permanently (%v)", i+1, len(points), err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// writeWithRetry attempts to write points up to maxAttempts times with
+// exponential back-off. Unrecoverable 4xx errors (except 429) are returned
+// immediately without retrying.
+func writeWithRetry(ctx context.Context, iot *influxdb3.Client, points []*influxdb3.Point, maxAttempts int) error {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		err := iot.WritePoints(ctx, points, influxdb3.WithNoSync(true))
 		if err == nil {
 			return nil
 		}
 		errStr := err.Error()
-		// 4xx errors other than 429 (rate limit) are not recoverable – log & skip.
+		// 4xx errors other than 429 (rate limit) are not recoverable – return immediately.
 		if is4xx(errStr) && !strings.Contains(errStr, "429") {
 			return err
 		}
@@ -730,7 +786,7 @@ func main() {
 		SetPassword("public").
 		SetConnectionLostHandler(connLostHandler)
 
-	incoming := make(chan [2]string, 64)
+	incoming := make(chan [2]string, 256)
 	mqttOpts.SetDefaultPublishHandler(func(_ MQTT.Client, msg MQTT.Message) {
 		incoming <- [2]string{msg.Topic(), string(msg.Payload())}
 	})
@@ -748,56 +804,82 @@ func main() {
 	}
 	log.Printf("MQTT: subscribed to %s", subTopic)
 
-	// Main loop ──────────────────────────────────────────────────────────────
-	for msg := range incoming {
-		topic, payload := msg[0], msg[1]
-
-		// Extract topic identifier from device/IDENTIFIER/telemetry.
-		// For custom provider IDENTIFIER is deviceID; for LNS providers it is devEUI.
-		parts := strings.SplitN(topic, "/", 3)
-		if len(parts) < 2 {
-			log.Printf("[main] unexpected topic format: %s", topic)
-			continue
+	// WRITE_WORKERS controls how many goroutines process MQTT messages in parallel.
+	// Each worker handles the full decode+write pipeline for one message.
+	// Defaults to 2× GOMAXPROCS so InfluxDB3 HTTP latency is hidden behind concurrency.
+	numWorkers := runtime.GOMAXPROCS(0) * 2
+	if raw := os.Getenv("WRITE_WORKERS"); raw != "" {
+		if v, convErr := strconv.Atoi(raw); convErr == nil && v > 0 {
+			numWorkers = v
 		}
-		topicIdentifier := parts[1]
-
-		provider := detectProvider(payload)
-		if provider == "" {
-			registryMu.RLock()
-			configFromTopic, exists := deviceMap[topicIdentifier]
-			registryMu.RUnlock()
-			if exists {
-				provider = "custom"
-				log.Printf("[provider] fallback to custom for known device_id=%s model=%s", topicIdentifier, configFromTopic.Model)
-			} else {
-				log.Printf("[drop] cannot detect provider topic=%s", topic)
-				continue
-			}
-		}
-
-		registryMu.RLock()
-		currentDeviceMap := deviceMap
-		currentDevEUIToDeviceID := devEUIToDeviceID
-		registryMu.RUnlock()
-
-		deviceID, devEUI, config, known := resolveIncomingDevice(provider, topicIdentifier, currentDeviceMap, currentDevEUIToDeviceID)
-		if !known {
-			if provider == "custom" {
-				log.Printf("[drop] unknown custom device_id=%s topic=%s", topicIdentifier, topic)
-			} else {
-				log.Printf("[drop] unknown LNS mapping dev_eui=%s provider=%s topic=%s", topicIdentifier, provider, topic)
-			}
-			continue
-		}
-
-		// Write raw payload to audit_iot before any decoding.
-		writeAuditLog(ctx, clients.AuditIoT, deviceID, payload, time.Now())
-
-		if devEUI != "" {
-			log.Printf("[recv] topic=%s provider=%s device_id=%s dev_eui=%s model=%s", topic, provider, deviceID, devEUI, config.Model)
-		} else {
-			log.Printf("[recv] topic=%s provider=%s device_id=%s model=%s", topic, provider, deviceID, config.Model)
-		}
-		parseMsg(ctx, clients.IoTSensors, provider, deviceID, devEUI, config, payload)
 	}
+	log.Printf("[main] starting %d worker goroutines", numWorkers)
+
+	// Worker pool ─────────────────────────────────────────────────────────────
+	// Each worker drains from the shared incoming channel. The MQTT publish
+	// handler never blocks as long as the channel has capacity (256 slots).
+	// Workers share read-only access to registry maps (protected by registryMu)
+	// and the influxdb3 clients (which are goroutine-safe).
+	var workerWG sync.WaitGroup
+	for range numWorkers {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for msg := range incoming {
+				topic, payload := msg[0], msg[1]
+
+				// Extract topic identifier from device/IDENTIFIER/telemetry.
+				// For custom provider IDENTIFIER is deviceID; for LNS providers it is devEUI.
+				parts := strings.SplitN(topic, "/", 3)
+				if len(parts) < 2 {
+					log.Printf("[main] unexpected topic format: %s", topic)
+					continue
+				}
+				topicIdentifier := parts[1]
+
+				provider := detectProvider(payload)
+				if provider == "" {
+					registryMu.RLock()
+					configFromTopic, exists := deviceMap[topicIdentifier]
+					registryMu.RUnlock()
+					if exists {
+						provider = "custom"
+						log.Printf("[provider] fallback to custom for known device_id=%s model=%s", topicIdentifier, configFromTopic.Model)
+					} else {
+						log.Printf("[drop] cannot detect provider topic=%s", topic)
+						continue
+					}
+				}
+
+				registryMu.RLock()
+				currentDeviceMap := deviceMap
+				currentDevEUIToDeviceID := devEUIToDeviceID
+				registryMu.RUnlock()
+
+				deviceID, devEUI, config, known := resolveIncomingDevice(provider, topicIdentifier, currentDeviceMap, currentDevEUIToDeviceID)
+				if !known {
+					if provider == "custom" {
+						log.Printf("[drop] unknown custom device_id=%s topic=%s", topicIdentifier, topic)
+					} else {
+						log.Printf("[drop] unknown LNS mapping dev_eui=%s provider=%s topic=%s", topicIdentifier, provider, topic)
+					}
+					continue
+				}
+
+				if devEUI != "" {
+					log.Printf("[recv] topic=%s provider=%s device_id=%s dev_eui=%s model=%s", topic, provider, deviceID, devEUI, config.Model)
+				} else {
+					log.Printf("[recv] topic=%s provider=%s device_id=%s model=%s", topic, provider, deviceID, config.Model)
+				}
+
+				// Audit log and sensor decode+write run concurrently: they target
+				// different InfluxDB3 databases so there is no ordering requirement.
+				auditPayload, auditDeviceID, auditNow := payload, deviceID, time.Now()
+				go writeAuditLog(ctx, clients.AuditIoT, auditDeviceID, auditPayload, auditNow)
+
+				parseMsg(ctx, clients.IoTSensors, provider, deviceID, devEUI, config, payload)
+			}
+		}()
+	}
+	workerWG.Wait()
 }
