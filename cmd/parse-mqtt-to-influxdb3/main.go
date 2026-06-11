@@ -352,6 +352,19 @@ func detectProvider(message string) string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Colored logging helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ANSI color codes. logError prints in bold red; logWarn in bold yellow.
+// Both write to the same destination as log.Printf so timestamps align.
+func logError(format string, args ...any) {
+	log.Printf("\033[1;31m[ERROR] "+format+"\033[0m", args...)
+}
+func logWarn(format string, args ...any) {
+	log.Printf("\033[1;33m[WARN]  "+format+"\033[0m", args...)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // InfluxDB3 writer
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -389,7 +402,7 @@ func writeSensorRecords(ctx context.Context, iot *influxdb3.Client, records []re
 	points := make([]*influxdb3.Point, 0, len(records))
 	for _, r := range records {
 		if err := validateRecord(r); err != nil {
-			log.Printf("[validate] dropping record: %v", err)
+			logWarn("dropping record: %v", err)
 			continue
 		}
 		p := influxdb3.NewPointWithMeasurement("sensor_data").
@@ -434,17 +447,23 @@ func writeSensorRecords(ctx context.Context, iot *influxdb3.Client, records []re
 	}
 	// Batch failed — fall back to per-point writes so one bad record does not
 	// silently drop all other sensor readings from the same message.
-	log.Printf("[write] batch failed (%v) – retrying %d points individually", batchErr, len(points))
-	var firstErr error
+	logWarn("batch of %d points failed (%v) – retrying individually", len(points), batchErr)
+	var dropped int
 	for i, pt := range points {
 		if err := writeWithRetry(ctx, iot, []*influxdb3.Point{pt}, maxAttempts); err != nil {
-			log.Printf("[write] point %d/%d failed permanently (%v)", i+1, len(points), err)
-			if firstErr == nil {
-				firstErr = err
-			}
+			// Include the tag values so the bad point is identifiable in logs.
+			devID, _ := pt.GetTag("device_id")
+			sensorType, _ := pt.GetTag("sensor_type")
+			logError("point %d/%d dropped permanently: device_id=%s sensor_type=%s error=%v",
+				i+1, len(points), devID, sensorType, err)
+			dropped++
 		}
 	}
-	return firstErr
+	if dropped > 0 {
+		logError("%d/%d points dropped for this message", dropped, len(points))
+		return fmt.Errorf("%d points failed to write", dropped)
+	}
+	return nil
 }
 
 // writeWithRetry attempts to write points up to maxAttempts times with
@@ -459,20 +478,37 @@ func writeWithRetry(ctx context.Context, iot *influxdb3.Client, points []*influx
 		errStr := err.Error()
 		// 4xx errors other than 429 (rate limit) are not recoverable – return immediately.
 		if is4xx(errStr) && !strings.Contains(errStr, "429") {
+			if strings.Contains(errStr, "404") {
+				logError("write rejected with 404 — database may not exist in InfluxDB3 (create it first): %v", err)
+			} else {
+				logError("write rejected by InfluxDB3 (unrecoverable %s): %v", extractHTTPStatus(errStr), err)
+			}
+			return err
+		}
+		if is5xxTransient(errStr) {
+			if attempt < maxAttempts {
+				backoff := time.Duration(attempt*attempt) * 250 * time.Millisecond
+				logWarn("write attempt %d/%d: InfluxDB3 unreachable (proxy/server down: %v) — retrying in %v", attempt, maxAttempts, err, backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			logError("write failed after %d attempts — InfluxDB3 unreachable: %v", maxAttempts, err)
 			return err
 		}
 		if attempt < maxAttempts {
 			backoff := time.Duration(attempt*attempt) * 250 * time.Millisecond
-			log.Printf("[write] attempt %d/%d failed (%v) – retrying in %v", attempt, maxAttempts, err, backoff)
+			logWarn("write attempt %d/%d failed (%v) — retrying in %v", attempt, maxAttempts, err, backoff)
 			time.Sleep(backoff)
 		} else {
+			logError("write failed after %d attempts: %v", maxAttempts, err)
 			return err
 		}
 	}
 	return nil // unreachable
 }
 
-// is4xx reports whether an error string contains an HTTP 4xx status code.
+// is4xx reports whether an error string contains an unrecoverable HTTP 4xx status code.
+// 429 (rate limit) is excluded — it is transient and should be retried.
 func is4xx(errStr string) bool {
 	for _, code := range []string{"400", "401", "403", "404", "405", "422"} {
 		if strings.Contains(errStr, code) {
@@ -480,6 +516,26 @@ func is4xx(errStr string) bool {
 		}
 	}
 	return false
+}
+
+// is5xxTransient reports HTTP 5xx errors that are worth retrying (proxy/server down).
+func is5xxTransient(errStr string) bool {
+	for _, s := range []string{"502", "503", "Bad Gateway", "Service Unavailable"} {
+		if strings.Contains(errStr, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractHTTPStatus returns the first HTTP status code found in errStr, or "4xx".
+func extractHTTPStatus(errStr string) string {
+	for _, code := range []string{"400", "401", "403", "404", "405", "422"} {
+		if strings.Contains(errStr, code) {
+			return code
+		}
+	}
+	return "4xx"
 }
 
 // writeAuditLog writes the raw MQTT payload to the audit_log measurement.
@@ -507,8 +563,8 @@ func writeAuditLog(ctx context.Context, audit *influxdb3.Client, deviceID, rawDa
 		SetTag("event_type", "payload_ingest").
 		SetStringField("raw_data", rawData).
 		SetTimestamp(ts)
-	if err := audit.WritePoints(ctx, []*influxdb3.Point{p}, influxdb3.WithNoSync(true)); err != nil {
-		log.Printf("[audit] write error for %s: %v", deviceID, err)
+	if err := writeWithRetry(ctx, audit, []*influxdb3.Point{p}, 3); err != nil {
+		logWarn("audit write failed for device_id=%s: %v", deviceID, err)
 	}
 }
 
@@ -536,7 +592,7 @@ func writeCalibrations(ctx context.Context, iot *influxdb3.Client, deviceMap map
 		return
 	}
 	if err := iot.WritePoints(ctx, points, influxdb3.WithNoSync(true)); err != nil {
-		log.Printf("[calibration] write error: %v", err)
+		logError("calibration write failed: %v", err)
 	} else {
 		log.Printf("[calibration] wrote %d entries to sensor_calibration", len(points))
 	}
@@ -597,7 +653,7 @@ func parseDeviceModel(ctx context.Context, iot *influxdb3.Client,
 		records[i].MacAddress = config.MacAddress
 	}
 	if err := writeSensorRecords(ctx, iot, records); err != nil {
-		log.Printf("[parse] write error for %s: %v", deviceID, err)
+		logError("sensor write failed for device_id=%s model=%s: %v", deviceID, deviceModel, err)
 	} else {
 		if devEUI != "" {
 			log.Printf("[influxdb3] wrote %d points: device_model=%s device_id=%s dev_eui=%s",
