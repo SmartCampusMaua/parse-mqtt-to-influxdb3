@@ -1,4 +1,18 @@
 {
   "version": "1",
-  "devices": []
+  "devices": [
+    {
+      "device_id": "019f708a-98a6-7d14-9f26-91d2c85fcc02",
+      "device_model": "em300_di",
+      "device_type": "lorawan",
+      "serial_number": "",
+      "dev_eui": "0011223344556677",
+      "asset_id": "",
+      "asset_coords": {
+        "alt": 0,
+        "lat": 0,
+        "lng": 0
+      }
+    }
+  ]
 }
