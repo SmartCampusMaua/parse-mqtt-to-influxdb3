@@ -50,6 +50,18 @@ func NewBool(sensorType, deviceModel, deviceID, provider string, value bool, ts 
 // SensorTypes defines every canonical sensor_type tag value written to sensor_data.
 // Use the ST singleton — never hardcode the string literals in parsers.
 type SensorTypes struct {
+	// ── IMT LoraNodeV3 / Soil Moisture 3 Depth Levels (LNV3-SM3DL) ─────────
+	SMDL1        string //SoilMoisture @ 10 cm of Depth Level
+	SMDL2        string // SoilMoisture @ 30 cm of Depth Level
+	SMDL3        string // SoilMoisture @ 70 cm of Depth Level
+	BoardVoltage string // board_voltage
+
+	// ── IMT LoraNodeV3 / Solenoid Valve Control (LNV3-SVC) ───────────────
+	SV1 string // Solenoid Valve 1
+	SV2 string // Solenoid Valve 2
+	SV3 string // Solenoid Valve 3
+	// PulseCount string // pulse_count
+
 	// ── Weather / environmental (Khomp NIT21LI-EMW104) ───────────────────
 	InternalTemp string // internal_temp
 	InternalRH   string // internal_rh
@@ -146,6 +158,9 @@ type SensorTypes struct {
 }
 
 var ST = SensorTypes{
+	SMDL1: "smdl_1", SMDL2: "smdl_2", SMDL3: "smdl_3", BoardVoltage: "board_voltage",
+	SV1: "sv_1", SV2: "sv_2", SV3: "sv_3",
+
 	InternalTemp: "internal_temp", InternalRH: "internal_rh",
 	AirTemp: "air_temp", AirRH: "air_rh",
 	WindSpeed: "wind_speed", WindGust: "wind_gust", WindDir: "wind_dir",

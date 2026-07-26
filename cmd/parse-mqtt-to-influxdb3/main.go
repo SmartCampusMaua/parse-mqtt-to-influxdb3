@@ -79,6 +79,7 @@ func (c *DBClients) Close() {
 type DeviceModel string
 
 const (
+	LNV3    DeviceModel = "LNV3"    // IMT LoraNodeV3 series
 	DTL200  DeviceModel = "DTL200"  // Khomp DTL200 series
 	EM300   DeviceModel = "EM300"   // Milesight EM300 series
 	EM500   DeviceModel = "EM500"   // Milesight EM500 series

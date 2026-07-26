@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/devices/imt"
 	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/devices/khomp"
 	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/devices/kron"
 	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/devices/milesight"
@@ -37,6 +38,12 @@ var lnsParsers = map[string]lnsParser{
 	},
 	"WS101": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
 		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
+	},
+	"LNV3_SM3DL": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
+		return imt.Decode(model, submodel, payload, deviceID, provider, ts)
+	},
+	"LNV3_SVC": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
+		return imt.Decode(model, submodel, payload, deviceID, provider, ts)
 	},
 }
 
