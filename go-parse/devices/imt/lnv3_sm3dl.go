@@ -7,7 +7,7 @@ import (
 )
 
 // decodeLNV3SM3DL writes the raw analog probe readings (tag 0x0D) as
-// smdl_1/2/3. The moisture-percentage curve (15000 × raw^power, scaled per
+// smdl1/2/3. The moisture-percentage curve (15000 × raw^power, scaled per
 // depth) is a per-probe cloud calibration, not a device measurement — it
 // belongs in each device's sensor_calibration entry (scale/offset/power in
 // devices.json), applied downstream, not hardcoded here.

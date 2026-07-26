@@ -9,7 +9,7 @@ import (
 )
 
 func TestDecodeLNV3SVC(t *testing.T) {
-	// tag 0x0D x3: solenoid1=2000 (open), solenoid2=1000 (closed), solenoid3=1600 (open)
+	// tag 0x0D x3: solenoid1=2000, solenoid2=1000, solenoid3=1600 (raw readings)
 	// tag 0x0B: counter=42
 	// tag 0x0C: board voltage raw=3300 (-> 3.3 V)
 	payload := []byte{
@@ -29,24 +29,21 @@ func TestDecodeLNV3SVC(t *testing.T) {
 	}
 
 	cases := []struct {
-		name     string
-		sv       string
-		wantBool bool
+		name string
+		sv   string
+		want int64
 	}{
-		{"SV1", st.SV1, true},
-		{"SV2", st.SV2, false},
-		{"SV3", st.SV3, true},
+		{"SV1", st.SV1, 2000},
+		{"SV2", st.SV2, 1000},
+		{"SV3", st.SV3, 1600},
 	}
 	for _, c := range cases {
 		r, ok := got[c.sv]
-		if !ok {
-			t.Fatalf("%s: no record for sensor_type %q", c.name, c.sv)
+		if !ok || r.ValueInt == nil {
+			t.Fatalf("%s: no int record, got %+v", c.name, r)
 		}
-		if r.ValueType != "bool" || r.ValueBool == nil {
-			t.Fatalf("%s: expected bool record, got %+v", c.name, r)
-		}
-		if *r.ValueBool != c.wantBool {
-			t.Errorf("%s: got %v, want %v", c.name, *r.ValueBool, c.wantBool)
+		if *r.ValueInt != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, *r.ValueInt, c.want)
 		}
 	}
 
@@ -83,11 +80,11 @@ func TestDecodeLNV3SVC_RealPayload(t *testing.T) {
 
 	for _, sv := range []string{st.SV1, st.SV2, st.SV3} {
 		r, ok := got[sv]
-		if !ok || r.ValueBool == nil {
-			t.Fatalf("%s: no bool record, got %+v", sv, r)
+		if !ok || r.ValueInt == nil {
+			t.Fatalf("%s: no int record, got %+v", sv, r)
 		}
-		if *r.ValueBool != false {
-			t.Errorf("%s: got %v, want false", sv, *r.ValueBool)
+		if *r.ValueInt != 0 {
+			t.Errorf("%s: got %d, want 0", sv, *r.ValueInt)
 		}
 	}
 

@@ -125,9 +125,9 @@ type SensorTypes struct {
 	PowerS1      string // power_s1           VA
 	PowerS2      string // power_s2           VA
 	PowerS3      string // power_s3           VA
-	PowerFactor1 string // power_factor_1         (FP1)
-	PowerFactor2 string // power_factor_2
-	PowerFactor3 string // power_factor_3
+	PowerFactor1 string // power_factor1          (FP1)
+	PowerFactor2 string // power_factor2
+	PowerFactor3 string // power_factor3
 	EnergySTotal string // energy_s_total     kVAh
 	Horimetre    string // horimetre          h
 
@@ -151,15 +151,15 @@ type SensorTypes struct {
 	// ── DTL200-SWL standardised analog/digital I/O names ────────────────
 	CurrentLoop     string // current_loop      mA   4-20 mA current-loop input
 	VoltageInput    string // voltage_input      V   0-30 V analog voltage input
-	DigitalInput1   string // digital_input_1        IN1 pin state (bool)
-	DigitalInput2   string // digital_input_2        IN2 pin state (bool)
+	DigitalInput1   string // digital_input1         IN1 pin state (bool)
+	DigitalInput2   string // digital_input2         IN2 pin state (bool)
 	InterruptLevel  string // interrupt_level        Exti pin level (bool)
 	InterruptStatus string // interrupt_status       Exti trigger active (bool)
 }
 
 var ST = SensorTypes{
-	SMDL1: "smdl_1", SMDL2: "smdl_2", SMDL3: "smdl_3", BoardVoltage: "board_voltage",
-	SV1: "sv_1", SV2: "sv_2", SV3: "sv_3",
+	SMDL1: "smdl1", SMDL2: "smdl2", SMDL3: "smdl3", BoardVoltage: "board_voltage",
+	SV1: "sv1", SV2: "sv2", SV3: "sv3",
 
 	InternalTemp: "internal_temp", InternalRH: "internal_rh",
 	AirTemp: "air_temp", AirRH: "air_rh",
@@ -184,7 +184,7 @@ var ST = SensorTypes{
 	PowerP1: "power_p1", PowerP2: "power_p2", PowerP3: "power_p3",
 	PowerQ1: "power_q1", PowerQ2: "power_q2", PowerQ3: "power_q3",
 	PowerSTotal: "power_s_total", PowerS1: "power_s1", PowerS2: "power_s2", PowerS3: "power_s3",
-	PowerFactor1: "power_factor_1", PowerFactor2: "power_factor_2", PowerFactor3: "power_factor_3",
+	PowerFactor1: "power_factor1", PowerFactor2: "power_factor2", PowerFactor3: "power_factor3",
 	EnergySTotal: "energy_s_total", Horimetre: "horimetre",
 	// digital input
 	PulseState: "pulse_state", PulseCount: "pulse_count", WaterFlow: "water_flow",
@@ -196,6 +196,6 @@ var ST = SensorTypes{
 	// DTL200 I/O
 	// DTL200 I/O
 	CurrentLoop: "current_loop", VoltageInput: "voltage_input",
-	DigitalInput1: "digital_input_1", DigitalInput2: "digital_input_2",
+	DigitalInput1: "digital_input1", DigitalInput2: "digital_input2",
 	InterruptLevel: "interrupt_level", InterruptStatus: "interrupt_status",
 }
