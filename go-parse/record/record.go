@@ -138,9 +138,13 @@ type SensorTypes struct {
 	WaterConv  string // water_conv         m³/pulse conversion factor (v1.3+)
 	PulseConv  string // pulse_conv         pulse conversion factor (v1.3+)
 
-	// ── Water / soil (EM500-SWL, DTL200-SWL) ─────────────────────────────
+	// ── Water / soil (EM500-SWL, EM500-SMTC, DTL200-SWL) ─────────────────
 	WaterLevel             string // water_level  m (EM500-SWL) | cm (DTL200 probe 0x00)
-	ElectricalConductivity string // electrical_conductivity  µS/cm
+	ElectricalConductivity string // electrical_conductivity  µS/cm (EM500-SMTC)
+	SoilTemp               string // soil_temp  °C (EM500-SMTC)
+	SoilMoisture           string // soil_moisture  % (EM500-SMTC)
+	TemperatureMutation    string // temperature_mutation  °C delta (EM500-SMTC alarm channel)
+	TemperatureAlarm       string // temperature_alarm  raw enum (device-specific — see device_model): EM500-SMTC 0=release 1=threshold 2=mutation; AT101 0=normal 1=abnormal
 
 	// ── Smart button (WS101) ──────────────────────────────────────────────
 	PressType  string // press_type  1=single 2=long 3=double
@@ -155,6 +159,43 @@ type SensorTypes struct {
 	DigitalInput2   string // digital_input2         IN2 pin state (bool)
 	InterruptLevel  string // interrupt_level        Exti pin level (bool)
 	InterruptStatus string // interrupt_status       Exti trigger active (bool)
+
+	// ── Bed / room presence & vital signs (VS373) ─────────────────────────
+	DetectionStatus string // detection_status  raw enum: 0=normal 1=vacant 2=in_bed 3=out_of_bed 4=fall
+	TargetStatus    string // target_status     raw enum: 0=normal 1=motionless 2=abnormal 3=lying_down
+	UseTimeNow      string // use_time_now      s
+	UseTimeToday    string // use_time_today    s
+
+	Region1Occupancy string // region1_occupancy  bool
+	Region2Occupancy string // region2_occupancy  bool
+	Region3Occupancy string // region3_occupancy  bool
+	Region4Occupancy string // region4_occupancy  bool
+	Region5Occupancy string // region5_occupancy  bool
+	Region6Occupancy string // region6_occupancy  bool
+
+	Region1OutOfBedTime string // region1_out_of_bed_time  s
+	Region2OutOfBedTime string // region2_out_of_bed_time  s
+	Region3OutOfBedTime string // region3_out_of_bed_time  s
+	Region4OutOfBedTime string // region4_out_of_bed_time  s
+	Region5OutOfBedTime string // region5_out_of_bed_time  s
+	Region6OutOfBedTime string // region6_out_of_bed_time  s
+
+	RespiratoryStatus string // respiratory_status  raw enum: 1=no_data_input 2=normal 3=tachypnea 4=bradypnea 5=undetectable
+	RespiratoryRate   string // respiratory_rate    breaths/min
+
+	AlarmID       string // alarm_id
+	AlarmType     string // alarm_type        raw enum: 0=fall 1=motionless 2=dwell 3=out_of_bed 4=occupied 5=vacant 6=bradynea 7=tachypnea 8=lying_down
+	AlarmStatus   string // alarm_status      raw enum: 1=triggered 2=deactivated 3=ignored 4=respiratory_status
+	AlarmRegionID string // alarm_region_id   present only for out_of_bed/bradynea/tachypnea alarm types
+
+	// ── Asset tracker (AT101) ──────────────────────────────────────────────
+	Temperature    string // temperature      °C
+	Latitude       string // latitude         °
+	Longitude      string // longitude        °
+	MotionStatus   string // motion_status    raw enum: 0=unknown 1=start 2=moving 3=stop
+	GeofenceStatus string // geofence_status  raw enum: 0=inside 1=outside 2=unset 3=unknown
+	DevicePosition string // device_position  raw enum: 0=normal 1=tilt
+	TamperStatus   string // tamper_status    raw enum: 0=install 1=uninstall
 }
 
 var ST = SensorTypes{
@@ -191,6 +232,8 @@ var ST = SensorTypes{
 	WaterConv: "water_conv", PulseConv: "pulse_conv",
 	// water / soil
 	WaterLevel: "water_level", ElectricalConductivity: "electrical_conductivity",
+	SoilTemp: "soil_temp", SoilMoisture: "soil_moisture",
+	TemperatureMutation: "temperature_mutation", TemperatureAlarm: "temperature_alarm",
 	// button
 	PressType: "press_type", PressState: "press_state", PressCount: "press_count",
 	// DTL200 I/O
@@ -198,4 +241,20 @@ var ST = SensorTypes{
 	CurrentLoop: "current_loop", VoltageInput: "voltage_input",
 	DigitalInput1: "digital_input1", DigitalInput2: "digital_input2",
 	InterruptLevel: "interrupt_level", InterruptStatus: "interrupt_status",
+	// VS373 bed / room presence & vital signs
+	DetectionStatus: "detection_status", TargetStatus: "target_status",
+	UseTimeNow: "use_time_now", UseTimeToday: "use_time_today",
+	Region1Occupancy: "region1_occupancy", Region2Occupancy: "region2_occupancy",
+	Region3Occupancy: "region3_occupancy", Region4Occupancy: "region4_occupancy",
+	Region5Occupancy: "region5_occupancy", Region6Occupancy: "region6_occupancy",
+	Region1OutOfBedTime: "region1_out_of_bed_time", Region2OutOfBedTime: "region2_out_of_bed_time",
+	Region3OutOfBedTime: "region3_out_of_bed_time", Region4OutOfBedTime: "region4_out_of_bed_time",
+	Region5OutOfBedTime: "region5_out_of_bed_time", Region6OutOfBedTime: "region6_out_of_bed_time",
+	RespiratoryStatus: "respiratory_status", RespiratoryRate: "respiratory_rate",
+	AlarmID: "alarm_id", AlarmType: "alarm_type",
+	AlarmStatus: "alarm_status", AlarmRegionID: "alarm_region_id",
+	// AT101 asset tracker
+	Temperature: "temperature", Latitude: "latitude", Longitude: "longitude",
+	MotionStatus: "motion_status", GeofenceStatus: "geofence_status",
+	DevicePosition: "device_position", TamperStatus: "tamper_status",
 }

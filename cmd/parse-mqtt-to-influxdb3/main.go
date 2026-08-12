@@ -118,13 +118,13 @@ type DeviceConfig struct {
 
 // DeviceEntry describes one device loaded from the external registry file.
 // If Allow is nil or true, the device is active; false disables ingestion.
+// Asset assignment (asset_id, asset_coords) lives in the separate asset
+// registry (assets.json), not here — see AssetEntry.
 type DeviceEntry struct {
 	Allow             *bool               `json:"allow,omitempty"`
 	DeviceID          string              `json:"device_id,omitempty"`
 	DeviceType        string              `json:"device_type,omitempty"` // "lorawan" or "ip"
 	SerialNumber      *string             `json:"serial_number"`         // required; warn if empty
-	AssetID           string              `json:"asset_id,omitempty"`
-	AssetCoords       *AssetCoords        `json:"asset_coords,omitempty"`
 	DevEUI            string              `json:"dev_eui,omitempty"`     // mandatory for lorawan
 	MacAddress        string              `json:"mac_address,omitempty"` // mandatory for ip
 	DeviceModel       DeviceModel         `json:"device_model,omitempty"`
@@ -134,7 +134,7 @@ type DeviceEntry struct {
 	Calibrations      []DeviceCalibration `json:"calibrations,omitempty"`
 }
 
-// AssetCoords stores optional device geolocation metadata.
+// AssetCoords stores optional asset geolocation metadata.
 type AssetCoords struct {
 	Lng float64 `json:"lng,omitempty"`
 	Lat float64 `json:"lat,omitempty"`
@@ -144,6 +144,29 @@ type AssetCoords struct {
 type DeviceRegistryFile struct {
 	Version string        `json:"version,omitempty"`
 	Devices []DeviceEntry `json:"devices"`
+}
+
+// ─── Asset registry ───────────────────────────────────────────────────────────
+
+// AssetEntry describes one physical asset loaded from the external asset
+// registry file. DeviceIDs lists every device_id (from devices.json) mounted
+// on this asset — the cross-reference lives here, not on the device.
+type AssetEntry struct {
+	AssetID     string       `json:"asset_id,omitempty"`
+	AssetCoords *AssetCoords `json:"asset_coords,omitempty"`
+	DeviceIDs   []string     `json:"device_ids,omitempty"`
+}
+
+type AssetRegistryFile struct {
+	Version string       `json:"version,omitempty"`
+	Assets  []AssetEntry `json:"assets"`
+}
+
+// AssetConfig is the per-device projection of AssetEntry resolved by
+// GetAssetsMap: which asset a device is mounted on, and where that asset is.
+type AssetConfig struct {
+	AssetID     string
+	AssetCoords AssetCoords
 }
 
 // ─── Registry validation ──────────────────────────────────────────────────────
@@ -173,13 +196,6 @@ func validateEntry(e DeviceEntry) error {
 		return fmt.Errorf("device %s: device_type must be \"lorawan\" or \"ip\", got %q", e.DeviceID, e.DeviceType)
 	}
 
-	if e.AssetID != "" && !isUUIDv7(e.AssetID) {
-		return fmt.Errorf("device %s: asset_id %q must be a valid UUIDv7", e.DeviceID, e.AssetID)
-	}
-	if e.AssetID == "" {
-		log.Printf("[registry] warning: device %s has no asset_id", e.DeviceID)
-	}
-
 	if dt == "LORAWAN" {
 		if e.DevEUI == "" {
 			return fmt.Errorf("device %s: dev_eui is required for lorawan devices", e.DeviceID)
@@ -195,15 +211,6 @@ func validateEntry(e DeviceEntry) error {
 		}
 		if _, err := net.ParseMAC(e.MacAddress); err != nil {
 			return fmt.Errorf("device %s: mac_address %q is invalid: %w", e.DeviceID, e.MacAddress, err)
-		}
-	}
-
-	if e.AssetCoords != nil {
-		if e.AssetCoords.Lat < -90 || e.AssetCoords.Lat > 90 {
-			return fmt.Errorf("device %s: asset_coords.lat %f out of range [-90, 90]", e.DeviceID, e.AssetCoords.Lat)
-		}
-		if e.AssetCoords.Lng < -180 || e.AssetCoords.Lng > 180 {
-			return fmt.Errorf("device %s: asset_coords.lng %f out of range [-180, 180]", e.DeviceID, e.AssetCoords.Lng)
 		}
 	}
 
@@ -267,11 +274,6 @@ func GetDevicesMap(registryPath string) (map[string]DeviceConfig, map[string]str
 			batteryMin = 3.3
 		}
 
-		assetCoords := AssetCoords{}
-		if entry.AssetCoords != nil {
-			assetCoords = *entry.AssetCoords
-		}
-
 		serialNumber := ""
 		if entry.SerialNumber != nil {
 			serialNumber = *entry.SerialNumber
@@ -294,8 +296,6 @@ func GetDevicesMap(registryPath string) (map[string]DeviceConfig, map[string]str
 			DeviceType:        strings.ToUpper(entry.DeviceType),
 			SerialNumber:      serialNumber,
 			MacAddress:        strings.ToLower(entry.MacAddress),
-			AssetID:           entry.AssetID,
-			AssetCoords:       assetCoords,
 			BatteryVoltageMax: batteryMax,
 			BatteryVoltageMin: batteryMin,
 			ProbeRangeM:       entry.ProbeRangeM,
@@ -312,6 +312,95 @@ func GetDevicesMap(registryPath string) (map[string]DeviceConfig, map[string]str
 	}
 
 	return deviceMap, devEUIToDeviceID, nil
+}
+
+// validateAssetEntry checks mandatory fields and format constraints for one
+// asset. Returns an error for hard failures; the caller decides how to log.
+func validateAssetEntry(a AssetEntry) error {
+	if a.AssetID == "" {
+		return fmt.Errorf("asset_id is required")
+	}
+	if !isUUIDv7(a.AssetID) {
+		return fmt.Errorf("asset %s: asset_id must be a valid UUIDv7", a.AssetID)
+	}
+	if a.AssetCoords != nil {
+		if a.AssetCoords.Lat < -90 || a.AssetCoords.Lat > 90 {
+			return fmt.Errorf("asset %s: asset_coords.lat %f out of range [-90, 90]", a.AssetID, a.AssetCoords.Lat)
+		}
+		if a.AssetCoords.Lng < -180 || a.AssetCoords.Lng > 180 {
+			return fmt.Errorf("asset %s: asset_coords.lng %f out of range [-180, 180]", a.AssetID, a.AssetCoords.Lng)
+		}
+	}
+	for _, deviceID := range a.DeviceIDs {
+		if !isUUIDv7(deviceID) {
+			return fmt.Errorf("asset %s: device_ids contains invalid UUIDv7 %q", a.AssetID, deviceID)
+		}
+	}
+	return nil
+}
+
+// GetAssetsMap loads the physical asset registry from a JSON file and
+// resolves it into a deviceID -> AssetConfig lookup via each asset's
+// device_ids cross-reference. All mandatory fields are validated; the whole
+// file is rejected on any error.
+func GetAssetsMap(registryPath string) (map[string]AssetConfig, error) {
+	contents, err := os.ReadFile(registryPath)
+	if err != nil {
+		return nil, fmt.Errorf("read asset registry file: %w", err)
+	}
+
+	var reg AssetRegistryFile
+	if err := json.Unmarshal(contents, &reg); err != nil {
+		return nil, fmt.Errorf("parse asset registry file: %w", err)
+	}
+
+	if reg.Version == "" {
+		log.Printf("[registry] warning: assets.json has no version field")
+	} else {
+		log.Printf("[registry] version=%s assets=%d", reg.Version, len(reg.Assets))
+	}
+
+	seenAssetID := make(map[string]bool, len(reg.Assets))
+	deviceToAsset := make(map[string]AssetConfig)
+
+	for i, a := range reg.Assets {
+		if err := validateAssetEntry(a); err != nil {
+			return nil, fmt.Errorf("entry[%d]: %w", i, err)
+		}
+		if seenAssetID[a.AssetID] {
+			return nil, fmt.Errorf("duplicate asset_id in registry: %s", a.AssetID)
+		}
+		seenAssetID[a.AssetID] = true
+
+		coords := AssetCoords{}
+		if a.AssetCoords != nil {
+			coords = *a.AssetCoords
+		}
+		cfg := AssetConfig{AssetID: a.AssetID, AssetCoords: coords}
+
+		for _, deviceID := range a.DeviceIDs {
+			if existing, exists := deviceToAsset[deviceID]; exists {
+				log.Printf("[registry] warning: device %s listed under multiple assets (%s and %s) — using %s",
+					deviceID, existing.AssetID, a.AssetID, a.AssetID)
+			}
+			deviceToAsset[deviceID] = cfg
+		}
+	}
+
+	return deviceToAsset, nil
+}
+
+// mergeAssetInfo backfills AssetID/AssetCoords onto each device from the
+// asset registry's device_ids cross-reference. Devices not listed under any
+// asset keep the zero value — asset assignment is optional.
+func mergeAssetInfo(deviceMap map[string]DeviceConfig, assetByDeviceID map[string]AssetConfig) {
+	for deviceID, cfg := range deviceMap {
+		if a, ok := assetByDeviceID[deviceID]; ok {
+			cfg.AssetID = a.AssetID
+			cfg.AssetCoords = a.AssetCoords
+			deviceMap[deviceID] = cfg
+		}
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -753,6 +842,10 @@ func main() {
 	if DEVICE_REGISTRY_FILE == "" {
 		DEVICE_REGISTRY_FILE = "devices.json"
 	}
+	ASSET_REGISTRY_FILE := os.Getenv("ASSET_REGISTRY_FILE")
+	if ASSET_REGISTRY_FILE == "" {
+		ASSET_REGISTRY_FILE = "assets.json"
+	}
 	DEVICE_REGISTRY_REFRESH_SEC := 30
 	if raw := os.Getenv("DEVICE_REGISTRY_REFRESH_SEC"); raw != "" {
 		if v, convErr := strconv.Atoi(raw); convErr == nil && v > 0 {
@@ -815,6 +908,18 @@ func main() {
 		panic(fmt.Sprintf("failed to load device registry (%s): %v", DEVICE_REGISTRY_FILE, err))
 	}
 	log.Printf("Device registry: file=%s deviceIDs=%d devEUI mappings=%d", DEVICE_REGISTRY_FILE, len(deviceMap), len(devEUIToDeviceID))
+
+	// Asset registry is supplementary metadata (no decoder depends on it), so
+	// a bad/missing assets.json logs a warning and starts with no asset links
+	// rather than crashing the service like a bad devices.json would.
+	assetByDeviceID, assetErr := GetAssetsMap(ASSET_REGISTRY_FILE)
+	if assetErr != nil {
+		log.Printf("[registry] warning: failed to load asset registry (%s): %v", ASSET_REGISTRY_FILE, assetErr)
+		assetByDeviceID = map[string]AssetConfig{}
+	}
+	mergeAssetInfo(deviceMap, assetByDeviceID)
+	log.Printf("Asset registry: file=%s deviceLinks=%d", ASSET_REGISTRY_FILE, len(assetByDeviceID))
+
 	writeCalibrations(ctx, clients.IoTSensors, deviceMap)
 
 	var registryMu sync.RWMutex
@@ -827,11 +932,21 @@ func main() {
 				log.Printf("[registry] reload failed: %v", reloadErr)
 				continue
 			}
+			// Keep the last known-good asset links on a transient assets.json
+			// read/parse failure, rather than wiping every device's asset
+			// assignment just because devices.json happened to reload fine.
+			if nextAssetByDeviceID, assetReloadErr := GetAssetsMap(ASSET_REGISTRY_FILE); assetReloadErr != nil {
+				log.Printf("[registry] asset reload failed, keeping previous asset links: %v", assetReloadErr)
+			} else {
+				assetByDeviceID = nextAssetByDeviceID
+			}
+			mergeAssetInfo(nextDeviceMap, assetByDeviceID)
 			registryMu.Lock()
 			deviceMap = nextDeviceMap
 			devEUIToDeviceID = nextDevEUIToDeviceID
 			registryMu.Unlock()
-			log.Printf("[registry] reloaded: file=%s deviceIDs=%d devEUI mappings=%d", DEVICE_REGISTRY_FILE, len(nextDeviceMap), len(nextDevEUIToDeviceID))
+			log.Printf("[registry] reloaded: file=%s deviceIDs=%d devEUI mappings=%d assetLinks=%d",
+				DEVICE_REGISTRY_FILE, len(nextDeviceMap), len(nextDevEUIToDeviceID), len(assetByDeviceID))
 		}
 	}()
 

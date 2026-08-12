@@ -36,11 +36,47 @@ var genericTypeLengths = map[byte]int{
 }
 
 // channelTypeOverride maps (channel, type) pairs that differ from the generic table.
+//
+// NOTE: channel 0x20 type 0xCE ("history") is intentionally only registered
+// once, for EM500-SWL below — EM500-SMTC (10B), VS373 (9B), and AT101 (12B)
+// all use the same (channel, type) pair with different, mutually-incompatible
+// lengths. ParseMilesightTLV has no model context (it runs before the model
+// is looked up), so this is not a benign omission: if any of those three
+// ever sends a 0x20/0xCE TLV, it will be mis-consumed as EM500-SWL's 6
+// bytes, corrupting the parse of whatever follows it in that uplink — not a
+// clean "unknown channel, stop." History/backfill records are out of scope
+// today (not written to sensor_data by any decoder in this package) — this
+// entry cannot be safely extended to a second length without first passing
+// model context into ParseMilesightTLV. Do not add another entry for that
+// pair without doing so.
 var channelTypeOverride = map[[2]byte]int{
 	{0x05, 0xE1}: 8, // water-conv: water_conv(2B)+pulse_conv(2B)+water(4B f32 LE)
 	{0x85, 0x00}: 2, // gpio alarm: gpio(1B)+alarm(1B)
 	{0x85, 0xE1}: 9, // water alarm: water_conv+pulse_conv+water+alarm(1B)
 	{0x20, 0xCE}: 6, // history (EM500-SWL): timestamp(4B)+depth(2B) — skipped
+
+	// EM500-SMTC
+	{0x04, 0xCA}: 2, // moisture (new resolution 0.01): uint16 LE ÷100
+	{0x05, 0x7F}: 2, // electrical conductivity: uint16 LE, µS/cm direct
+	{0x83, 0xD7}: 5, // temp+mutation alarm: temp(2B)+mutation(2B)+alarm_type(1B)
+
+	// VS373
+	{0x03, 0xF8}: 6, // detection target (v1.0.1): status(1B)+target(1B)+use_time_now(2B)+use_time_today(2B)
+	{0x07, 0xB0}: 8, // detection target (v1.0.2): status(1B)+target(1B)+use_time_now(3B)+use_time_today(3B)
+	{0x04, 0xF9}: 4, // region occupancy (v1.0.1): region1..4(1B each)
+	{0x09, 0xB2}: 6, // region type (v1.0.2): region1..6(1B each) — config, skipped
+	{0x0A, 0xB3}: 5, // region occupancy (v1.0.2): region_count(1B)+bitmask(4B)
+	{0x05, 0xFA}: 8, // out-of-bed (v1.0.1): region1..4 time(2B each)
+	{0x0B, 0xB4}: 9, // out-of-bed (v1.0.2) regions 1-3: time(3B each)
+	{0x0C, 0xB4}: 9, // out-of-bed (v1.0.2) regions 4-6: time(3B each)
+	{0x06, 0xFB}: 5, // alarm event: alarm_id(2B)+alarm_type(1B)+alarm_status(1B)+region_id(1B)
+	{0x08, 0xB1}: 3, // breathing detection: respiratory_status(1B)+respiratory_rate(2B)
+
+	// AT101
+	{0x83, 0x67}: 3, // temperature + abnormal alarm: temp(2B)+alarm(1B)
+	{0x04, 0x88}: 9, // location (normal report): lat(4B)+lon(4B)+status(1B)
+	{0x84, 0x88}: 9, // location (geofence/alarm report): lat(4B)+lon(4B)+status(1B)
+	{0x06, 0xD9}: 9, // wifi scan result: group(1B)+mac(6B)+rssi(1B)+motion(1B) — skipped
 }
 
 type TLV struct {
@@ -52,9 +88,12 @@ type TLV struct {
 type modelDecoder func([]TLV, string, string, time.Time) []record.SensorDataRecord
 
 var modelDecoders = map[string]modelDecoder{
-	"EM300_DI":  decodeEM300DI,
-	"EM500_SWL": decodeEM500SWL,
-	"WS101":     decodeWS101,
+	"EM300_DI":   decodeEM300DI,
+	"EM500_SWL":  decodeEM500SWL,
+	"EM500_SMTC": decodeEM500SMTC,
+	"WS101":      decodeWS101,
+	"VS373":      decodeVS373,
+	"AT101":      decodeAT101,
 }
 
 // ParseMilesightTLV tokenizes a Milesight binary uplink into channel/type/data entries.
@@ -97,5 +136,6 @@ func Decode(deviceModel, deviceSubmodel string, payload []byte, deviceID, provid
 }
 
 func le16(b []byte) uint16   { return binary.LittleEndian.Uint16(b) }
+func le24(b []byte) uint32   { return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 }
 func le32(b []byte) uint32   { return binary.LittleEndian.Uint32(b) }
 func f32le(b []byte) float64 { return float64(math.Float32frombits(binary.LittleEndian.Uint32(b))) }
