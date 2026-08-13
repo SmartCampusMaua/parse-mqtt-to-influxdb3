@@ -462,12 +462,23 @@ them.
 | `battery_level`     | %    | float      | Battery charge percentage                                          |
 | `temperature`       | °C   | float      | Ambient temperature (plain channel or the temp+alarm channel)      |
 | `temperature_alarm` | —    | int (enum) | `0` normal · `1` abnormal                                          |
-| `latitude`          | °    | float      | GPS/WiFi-resolved latitude (from normal `0x04` or alarm/geofence `0x84` report) |
-| `longitude`         | °    | float      | GPS/WiFi-resolved longitude                                        |
+| `latitude`          | °    | float      | GPS/WiFi-resolved latitude, up to 6 decimal places (from normal `0x04` or alarm/geofence `0x84` report); not written when the device has no fix yet — see below |
+| `longitude`         | °    | float      | GPS/WiFi-resolved longitude, same precision/fix caveat as `latitude`  |
 | `motion_status`     | —    | int (enum) | `0` unknown · `1` start · `2` moving · `3` stop                     |
 | `geofence_status`   | —    | int (enum) | `0` inside · `1` outside · `2` unset · `3` unknown                  |
 | `device_position`   | —    | int (enum) | `0` normal · `1` tilt                                              |
 | `tamper_status`     | —    | int (enum) | `0` install · `1` uninstall                                        |
+
+`latitude`/`longitude` are `int32 / 1,000,000`, giving up to 6 decimal
+places (~11 cm resolution) — full precision, not rounded. When the device
+hasn't obtained a GPS/WiFi fix yet it sends raw `-1` (`0xFFFFFFFF`) for both
+fields; the official Milesight decoder doesn't filter this and divides it
+through anyway, producing a bogus `(-0.000001, -0.000001)` point that plots
+at Null Island (0°N 0°E) on a geomap — easy to misread as "only showing one
+decimal" since it displays as `~0.0` at typical rounding. `at101.go` detects
+this sentinel and skips writing `latitude`/`longitude` for that uplink
+(logging instead); `motion_status`/`geofence_status` are still written from
+the same status byte, since they're independent of the GPS fix.
 
 WiFi scan results (`0x06/0xD9`) are tokenized but not decoded — each result
 carries a MAC address (not representable as float/int/bool) and a single

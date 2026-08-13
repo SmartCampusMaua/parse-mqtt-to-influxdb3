@@ -87,6 +87,67 @@ func TestDecodeAT101_Location(t *testing.T) {
 	}
 }
 
+func TestDecodeAT101_LocationFullPrecision(t *testing.T) {
+	// lat=-23.550520, lon=-46.633309 (Sao Paulo, 6 decimal digits) — proves
+	// the int32/1e6 decode keeps full GPS precision, not just 1 decimal place.
+	payload := []byte{
+		0x04, 0x88,
+		0xC8, 0xA5, 0x98, 0xFE, // lat_raw = -23550520
+		0xA3, 0x6E, 0x38, 0xFD, // lon_raw = -46633309
+		0x00,
+	}
+
+	records := DecodeAT101(payload, "dev-1", "chirpstackv4", time.Now())
+
+	st := record.ST
+	got := map[string]record.SensorDataRecord{}
+	for _, r := range records {
+		got[r.SensorType] = r
+	}
+
+	if lat := got[st.Latitude]; lat.ValueFloat == nil || *lat.ValueFloat != -23.55052 {
+		t.Errorf("Latitude: got %+v, want -23.55052", lat)
+	}
+	if lon := got[st.Longitude]; lon.ValueFloat == nil || *lon.ValueFloat != -46.633309 {
+		t.Errorf("Longitude: got %+v, want -46.633309", lon)
+	}
+}
+
+func TestDecodeAT101_LocationNoFix(t *testing.T) {
+	// lat_raw=lon_raw=-1 (0xFFFFFFFF): the device's "no GPS/WiFi fix yet"
+	// sentinel — reproduces the real payload pattern observed in production
+	// (both fields -1e-6, plotting at Null Island). Must not be written.
+	payload := []byte{
+		0x04, 0x88,
+		0xFF, 0xFF, 0xFF, 0xFF,
+		0xFF, 0xFF, 0xFF, 0xFF,
+		0x12,
+	}
+
+	records := DecodeAT101(payload, "dev-1", "chirpstackv4", time.Now())
+
+	st := record.ST
+	got := map[string]record.SensorDataRecord{}
+	for _, r := range records {
+		got[r.SensorType] = r
+	}
+
+	if _, ok := got[st.Latitude]; ok {
+		t.Errorf("Latitude: expected no record for no-fix sentinel, got %+v", got[st.Latitude])
+	}
+	if _, ok := got[st.Longitude]; ok {
+		t.Errorf("Longitude: expected no record for no-fix sentinel, got %+v", got[st.Longitude])
+	}
+	// motion_status/geofence_status are independent of the GPS fix and
+	// should still be written.
+	if motion := got[st.MotionStatus]; motion.ValueInt == nil || *motion.ValueInt != 2 {
+		t.Errorf("MotionStatus: got %+v, want 2", motion)
+	}
+	if geo := got[st.GeofenceStatus]; geo.ValueInt == nil || *geo.ValueInt != 1 {
+		t.Errorf("GeofenceStatus: got %+v, want 1", geo)
+	}
+}
+
 func TestDecodeAT101_LocationAlarmChannel(t *testing.T) {
 	// same structure but on the 0x84 (geofence/alarm report) channel
 	payload := []byte{
