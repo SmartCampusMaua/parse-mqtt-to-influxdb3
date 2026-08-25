@@ -54,6 +54,12 @@ var lnsParsers = map[string]lnsParser{
 	"LNV3_SVC": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
 		return imt.Decode(model, submodel, payload, deviceID, provider, ts)
 	},
+	"UC100": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
+		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
+	},
+	"UC300": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
+		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
+	},
 }
 
 func modelKey(model, submodel string) string {

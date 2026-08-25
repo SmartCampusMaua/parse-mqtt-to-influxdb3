@@ -1,3 +1,5 @@
 .env
 devices.json
 assets.json
+sensors.json
+device_channels.json

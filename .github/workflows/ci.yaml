@@ -28,4 +28,4 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: true
-          tags: smartcampusmaua/parse-mqtt-to-influxdb3:0.13
+          tags: smartcampusmaua/parse-mqtt-to-influxdb3:0.14

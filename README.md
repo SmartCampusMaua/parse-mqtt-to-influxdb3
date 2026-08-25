@@ -13,7 +13,7 @@ to an InfluxDB3 Core instance.
 | element     | value                                                                      |
 | ----------- | -------------------------------------------------------------------------- |
 | measurement | `sensor_data`                                                              |
-| tags        | `sensor_type`, `device_model`, `device_id`, `provider`, `dev_eui`\*        |
+| tags        | `sensor_type`, `device_model`, `device_id`, `provider`, `dev_eui`\*, `sensor_id`\*\* |
 | fields      | `value_float` **or** `value_int` **or** `value_bool` (exactly one per row) |
 | timestamp   | nanosecond precision, sourced from the LNS frame or device message         |
 
@@ -33,12 +33,20 @@ to an InfluxDB3 Core instance.
 | `"at101"`                       | `at101`                          |
 | `"lnv3_sm3dl"`                  | `lnv3_sm3dl`                     |
 | `"lnv3_svc"`                    | `lnv3_svc`                       |
+| `"uc100"`                       | `uc100`                          |
+| `"uc300"`                       | `uc300`                          |
 
 This single merged tag eliminates a redundant index dimension. Queries are
 `WHERE device_model = 'em300_di'`; to match all EM500 variants use
 `WHERE device_model LIKE 'em500%'`.
 
 `*` `dev_eui` is written only for LoRaWAN providers (`chirpstackv4`, `everynet`).
+
+`**` `sensor_id` is written only when the record resolves to an entry in
+[`sensors.json`](#sensor-registry-sensorsjson) — every non-UC decoder resolves
+it by `(device_id, sensor_type)`; UC100/UC300 resolve it by Modbus channel via
+[`device_channels.json`](#device-channel-registry-device_channelsjson). Empty
+when unregistered.
 
 ### `raw` — audit measurement in `audit_iot` database
 
@@ -49,7 +57,7 @@ This single merged tag eliminates a redundant index dimension. Queries are
 | fields      | `raw_data` (string ≤ 512 chars)                |
 | timestamp   | ingestion time (time.Now() at message receipt) |
 
-### `sensor_calibration` — written once at startup
+### `sensor_calibration` — written at startup and on every registry reload
 
 | element     | value                                              |
 | ----------- | --------------------------------------------------- |
@@ -58,6 +66,16 @@ This single merged tag eliminates a redundant index dimension. Queries are
 | fields      | `scale` (float), `offset` (float), `power` (float) |
 
 Formula applied by consumers at query time: `calibrated = (raw ^ power) × scale + offset`
+
+`writeCalibrations` (main.go) diffs against the **latest existing row** per
+`(device_id, sensor_type)` — queried via `fetchLatestCalibrations` — and only
+writes rows whose values actually changed. This makes it safe to call on
+every `DEVICE_REGISTRY_REFRESH_SEC` reload (so a `calibrations` edit in
+`devices.json` takes effect without a restart) without appending a duplicate
+row every time nothing changed. Before this, every process restart wrote a
+full duplicate set unconditionally — degrading the read-time run-length
+encoding the timeseries API relies on (calibration fields are meant to
+appear once per stream, not once per restart).
 
 This exists specifically for values that are a **cloud-side calibration
 curve** applied to a **raw device reading**, not a device measurement in its
@@ -90,8 +108,13 @@ Four InfluxDB3 databases are initialised simultaneously on the same host and tok
 ├── main.go                    MQTT loop · provider detection · InfluxDB3 writer
 │                              GetDevicesMap (loads + reloads devices.json)
 │                              GetAssetsMap (loads + reloads assets.json)
+│                              GetSensorsMap (loads + reloads sensors.json)
+│                              GetDeviceChannelsMap (loads + reloads device_channels.json)
+│                              resolveChannelRecord (UC100/UC300 channel → sensor resolution)
 ├── devices.json               Runtime device registry (model/devEui/calibrations)
 ├── assets.json                Runtime asset registry (asset_id/coords/device_ids)
+├── sensors.json                Runtime sensor registry (sensor_id/sensor_type/device_id)
+├── device_channels.json        Runtime UC100/UC300 Modbus/GPIO channel routing
 ├── record/
 │   └── record.go              SensorDataRecord · SensorTypes singleton (ST)
 └── go-parse/
@@ -110,7 +133,10 @@ Four InfluxDB3 databases are initialised simultaneously on the same host and tok
         │   ├── em500_smtc.go  EM500-SMTC decoder
         │   ├── ws101.go       WS101 smart button decoder
         │   ├── vs373.go       VS373 bed/room presence & vital signs decoder
-        │   └── at101.go       AT101 GPS/WiFi asset tracker decoder
+        │   ├── at101.go       AT101 GPS/WiFi asset tracker decoder
+        │   ├── uc.go          ParseUCTLV — shared UC100/UC300 tokenizer (Modbus is variable-length)
+        │   ├── uc100.go       UC100 Modbus-only decoder
+        │   └── uc300.go       UC300 Modbus + fixed GPIO/PT100/ADC decoder (channel-routed, see below)
         ├── imt/
         │   ├── imt.go         parseIMT (tag-based protocol, not TLV) · Decode(model, submodel, ...)
         │   ├── lnv3_sm3dl.go  LoraNodeV3 soil moisture (3 depth levels) decoder
@@ -147,6 +173,8 @@ Each file owns exactly one device codec. Naming pattern: **`model_submodel.go`**
 | `milesight/at101.go`         | `"AT101"`           | `"AT101"`           | `DecodeAT101`          |
 | `imt/lnv3_sm3dl.go`          | `"LNV3_SM3DL"`      | `"LNV3_SM3DL"`      | `DecodeLNV3SM3DL`      |
 | `imt/lnv3_svc.go`            | `"LNV3_SVC"`        | `"LNV3_SVC"`        | `DecodeLNV3SVC`        |
+| `milesight/uc100.go`         | `"UC100"`           | `"UC100"`           | `DecodeUC100`          |
+| `milesight/uc300.go`         | `"UC300"`           | `"UC300"`           | `DecodeUC300`          |
 
 **Adding a new device** (example: a new Milesight TLV-protocol device `EM310-TILT`):
 
@@ -179,13 +207,16 @@ Each file owns exactly one device codec. Naming pattern: **`model_submodel.go`**
 ## Decode chain (end to end)
 
 ```
-devices.json              assets.json
-  → GetDevicesMap()          → GetAssetsMap()
-    deviceMap[deviceID] =      deviceID -> AssetConfig{AssetID, AssetCoords}
-    DeviceConfig{Model, ...}     (resolved from each asset's device_ids array)
-    devEUIToDeviceID[devEUI]
-                    ↓                    ↓
-              mergeAssetInfo() backfills AssetID/AssetCoords onto DeviceConfig
+devices.json     assets.json    sensors.json         device_channels.json
+  → GetDevicesMap() → GetAssetsMap() → GetSensorsMap()  → GetDeviceChannelsMap()
+    deviceMap[..]=     deviceID ->      sensorMap[sensorID]  deviceChannels[deviceID]
+    DeviceConfig       AssetConfig      = {SensorType,        = {Modbus[chn]->sensorID,
+                                            DeviceID}             IO[chn]->sensorID}
+        ↓                   ↓                  ↓                        ↓
+  mergeAssetInfo()    buildSensorIndex(sensorMap)
+  backfills asset      → sensorIndex[deviceID+sensorType] = sensorID
+  info onto             (skips ambiguous device_id+sensor_type pairs —
+  DeviceConfig            those need channel-based resolution instead)
 
 MQTT message arrives on  device/<identifier>/telemetry
   → detectProvider()           → "chirpstackv4" | "everynet" | "custom"
@@ -195,10 +226,16 @@ MQTT message arrives on  device/<identifier>/telemetry
       → lookupKeys() = ["MODEL_SUBMODEL", "MODEL"]   (submodel key tried first)
       → lnsParsers["MODEL_SUBMODEL"]  → vendor.Decode()
           → vendor binaryDecoders["MODEL_SUBMODEL"]  → decodeXxx()
-              → []SensorDataRecord
+              → []SensorDataRecord   (UC100/UC300: ModbusChannel or IOChannel set, SensorType empty)
+  → per record, in parseDeviceModel:
+      → ModbusChannel/IOChannel != 0?  resolveChannelRecord(): deviceChannels[deviceID].Modbus/.IO[chn]
+                                        → sensorID → sensorMap[sensorID].SensorType
+                                        → no config entry? record dropped (logged), never written
+                                          under an empty/made-up sensor_type
+      → otherwise:                     sensorIndex[deviceID+sensorType] → SensorID (if registered)
   → writeSensorRecords()
       → device_model tag = lowercase(model + "_" + submodel)
-      → sensor_data point per record → InfluxDB3 iot_sensors
+      → sensor_data point per record (sensor_id tag set when resolved) → InfluxDB3 iot_sensors
 ```
 
 All lookups are O(1) map operations. No type switches, no reflect.
@@ -521,6 +558,43 @@ decision is a threshold applied downstream via `sensor_calibration`
 `calibrated > 0`), so the threshold can be recalibrated without reprocessing
 history.
 
+### `uc100` / `uc300` — RS485/Modbus controller (Milesight UC100/UC300)
+
+**No fixed `sensor_type` table** — unlike every other device above, what a
+Modbus channel (or, on UC300, a GPIO/PT100/ADC pin) measures is entirely
+site configuration, not something the decoder can know. `decodeUC100`/
+`decodeUC300` extract `(ModbusChannel, value)` or `(IOChannel, value)` pairs
+only; `sensor_type` and `sensor_id` are filled in afterward by
+`resolveChannelRecord` (main.go) from [`device_channels.json`](#device-channel-registry-device_channelsjson)
++ [`sensors.json`](#sensor-registry-sensorsjson) — see the [decode chain](#decode-chain-end-to-end)
+above. A channel with no `device_channels.json` entry is dropped (logged),
+never written under an empty or made-up `sensor_type`. This is why UC300's
+GPIO/PT100/ADC hardware needed no new `sensor_type` names discussed up
+front, despite this repo's [naming convention](#naming-convention-for-sensor_type)
+requiring exactly that for every other device: the physical meaning of a
+channel is attributed entirely through `device_channels.json` + `sensors.json`
+at deploy time (reusing an already-registered `sensor_type`, or a newly
+discussed one), the same as a Modbus channel — never invented in Go.
+
+Wire format reference: `https://github.com/Milesight-IoT/SensorDecoders/tree/main/uc-series`.
+The Modbus channel entry is `[0xFF][0x19][channel_id][data_length (unused
+on the wire — length is derived from data_type instead)][data_type: bit7=sign,
+bits0-6=type][value: 1/2/4 bytes depending on type]`; `[0xFF][0x15][channel_id]`
+reports a read error for that channel (logged, no `sensor_data` point written).
+UC100 and UC300 firmware agree on the byte length per `data_type` code but
+disagree on what two of those codes actually mean — ported byte-for-byte
+per device, see the doc comments in `uc100.go`/`uc300.go`.
+
+UC300's fixed-hardware channels (`channel_id` 3-14: GPIO input/output,
+PT100, ADC current/voltage) are decoded the same way, carrying `IOChannel`
+instead of `ModbusChannel` — only their **plain instantaneous reading**
+variant (`data_type` `0x00`/`0xC8`/`0x01`/`0x67`/`0x02`). The **statistics**
+variant (`0xE2`: current value + max + min + avg, packed as four float16s)
+is tokenized (so it doesn't corrupt the parse of whatever follows it) but
+not decoded — a single `sensor_data` point can only carry one value per
+`(sensor_type, timestamp)`, same reasoning as VS373's WiFi scan results.
+UC100 has none of this hardware, so it's unaffected.
+
 ---
 
 ## Provider detection
@@ -687,6 +761,116 @@ crash.
 
 ---
 
+## Sensor registry (`sensors.json`)
+
+Canonical registry of every **sensor** (one measurement stream), decoupled
+from `devices.json` on purpose. `sensor_id` is the **stable identity of a
+measurement stream** — assigned once (UUIDv7, not derived/hashed) and never
+recomputed; it persists across a device swap (repoint the `device_id` FK,
+`sensor_id` itself doesn't change). `sensor_type` lives **only here** — not
+duplicated into `device_channels.json`.
+
+Not unique on `(device_id, sensor_type)`: two identical instruments on the
+same RS485 bus can legitimately share a `sensor_type` with different
+`sensor_id`s — see [Device channel registry](#device-channel-registry-device_channelsjson)
+for how those get disambiguated.
+
+Loaded at startup and reloaded on the same `DEVICE_REGISTRY_REFRESH_SEC`
+interval as `devices.json`. Like `assets.json`, a bad or missing
+`sensors.json` is **non-fatal** — logs a warning and runs with an empty
+sensor index rather than crashing.
+
+### Field reference
+
+| field         | type   | required      | notes                                                        |
+| --------------- | -------- | ---------------- | ----------------------------------------------------------------- |
+| `version`     | string | —              | top-level; log-only; bump when schema changes                |
+| `sensor_id`   | UUIDv7 | **mandatory**  | unique sensor identifier — stable identity of a measurement stream |
+| `sensor_type` | string | **mandatory**  | must match a `record.SensorTypes` field (validated via `record.AllSensorTypes()`) |
+| `device_id`   | UUIDv7 | **mandatory**  | FK → `devices.json`; soft/lenient — no error if the device isn't found |
+
+### Full example
+
+```json
+{
+  "version": "1",
+  "sensors": [
+    { "sensor_id": "01a03953-9387-76dd-bc9f-ee2b674fed66", "sensor_type": "water_level", "device_id": "01a03953-9387-7631-b960-5d7f9305a67c" },
+    { "sensor_id": "01a03953-9387-76e9-b9dd-ce9662f2e172", "sensor_type": "battery_level", "device_id": "01a03953-9387-7631-b960-5d7f9305a67c" }
+  ]
+}
+```
+
+**Validation rules (applied on every load):**
+
+- `sensor_id` and `device_id` must be valid UUIDv7
+- `sensor_type` must be a recognized `record.ST` value — add it to `record.go` first (after discussion; see [naming convention](#naming-convention-for-sensor_type)) if it's genuinely new
+- Duplicate `sensor_id` causes the whole file to be rejected
+- A `device_id` with no matching `devices.json` entry is not an error — soft FK, same philosophy as `assets.json`
+
+`buildSensorIndex` (main.go) derives a `(device_id, sensor_type) -> sensor_id`
+lookup from this file for every non-UC decoder. When two sensors share the
+same `(device_id, sensor_type)` pair, **both are excluded** from that index
+(logged as ambiguous) — such pairs can only be resolved by channel number,
+via `device_channels.json`.
+
+---
+
+## Device channel registry (`device_channels.json`)
+
+**UC100/UC300 only.** Routes a physical Modbus channel, or (UC300 only) a
+fixed-hardware GPIO/PT100/ADC channel, to a `sensor_id`. Deliberately
+carries **no** `sensor_type` — that lives only in `sensors.json`, looked up
+via the `sensor_id` here. This is what lets the resolution step tell two
+same-`sensor_type` instruments on one bus apart, since `sensors.json` alone
+can't (see above).
+
+A UC100/UC300 decoder cannot know what any channel *means* — that's
+entirely site config. Records from `decodeUC100`/`decodeUC300` carry
+`ModbusChannel` or `IOChannel` instead of `SensorType`; `resolveChannelRecord`
+(main.go) looks up `deviceChannels[deviceID].Modbus[channel]` or `.IO[channel]`
+→ `sensor_id` → `sensors.json`'s `sensor_type`, filling both `SensorType` and
+`SensorID` before write. **A channel with no entry here is dropped** (logged),
+never written under an empty or made-up `sensor_type`.
+
+Loaded at startup and reloaded on the same `DEVICE_REGISTRY_REFRESH_SEC`
+interval. Non-fatal on a bad/missing file, same as `sensors.json`/`assets.json`.
+
+### Field reference
+
+| field             | type   | required                          | notes                                                  |
+| ------------------- | -------- | ------------------------------------ | ----------------------------------------------------------- |
+| `version`         | string | —                                  | top-level; log-only; bump when schema changes         |
+| `device_id`       | UUIDv7 | **mandatory**                      | FK → `devices.json`, must be `uc100` or `uc300`        |
+| `sensor_id`       | UUIDv7 | **mandatory**                      | FK → `sensors.json`                                    |
+| `modbus_channel`  | int    | required for a Modbus entry (1-32) | must be set together with `modbus_slave_id`            |
+| `modbus_slave_id` | int    | required for a Modbus entry        | documentation only — not read at decode time           |
+| `io_channel`      | int    | required for an IO entry (3-14)    | UC300 only — UC100 has no fixed I/O hardware. Covers GPIO input/output, PT100, and ADC current/voltage alike (they share one `channel_id` namespace on the wire — see the `uc300` section above) |
+
+Each entry is **either** a Modbus channel (`modbus_channel` + `modbus_slave_id`)
+**or** an IO channel (`io_channel`) — never both, never neither.
+
+### Full example
+
+```json
+{
+  "version": "1",
+  "channels": [
+    { "device_id": "01a03953-9387-7631-b960-5d7f9305a67c", "sensor_id": "01a03953-9387-76dd-bc9f-ee2b674fed66", "modbus_channel": 3, "modbus_slave_id": 2 },
+    { "device_id": "01a01fce-8746-7346-af7a-7db92b17cb72", "sensor_id": "01a03953-9387-76e9-b9dd-ce9662f2e172", "io_channel": 9 }
+  ]
+}
+```
+
+**Validation rules (applied on every load):**
+
+- `device_id` and `sensor_id` must be valid UUIDv7
+- Exactly one of (`modbus_channel` + `modbus_slave_id`) or `io_channel` must be set
+- `io_channel` on a `device_id` known to be `device_model=uc100` is a **hard error** — UC100 has no fixed I/O hardware (this check only fires when the device is actually found; an unknown `device_id` is a soft FK like everywhere else)
+- Duplicate `sensor_id`, or duplicate `modbus_channel`/`io_channel` on the same device, causes the whole file to be rejected
+
+---
+
 ## Environment variables
 
 | variable                      | default                        | description                                        |
@@ -696,4 +880,6 @@ crash.
 | `INFLUXDB_TOKEN`              | _(empty)_                      | Auth token (may be empty for unauthenticated Core) |
 | `DEVICE_REGISTRY_FILE`        | `devices.json`                 | Path to the JSON device registry                   |
 | `ASSET_REGISTRY_FILE`         | `assets.json`                  | Path to the JSON asset registry                    |
-| `DEVICE_REGISTRY_REFRESH_SEC` | `30`                            | Poll interval (seconds) for hot-reload of both registries |
+| `SENSOR_REGISTRY_FILE`        | `sensors.json`                 | Path to the JSON sensor registry                    |
+| `DEVICE_CHANNEL_REGISTRY_FILE`| `device_channels.json`         | Path to the JSON UC100/UC300 channel registry        |
+| `DEVICE_REGISTRY_REFRESH_SEC` | `30`                            | Poll interval (seconds) for hot-reload of all four registries |

@@ -1,7 +1,10 @@
 // Package record defines shared types written to InfluxDB3 sensor_data measurement.
 package record
 
-import "time"
+import (
+	"reflect"
+	"time"
+)
 
 // ─── SensorDataRecord ────────────────────────────────────────────────────────
 
@@ -13,10 +16,22 @@ type SensorDataRecord struct {
 	ValueBool   *bool
 	DeviceModel string // lowercase merged model_submodel, e.g. "em300_di"
 	DeviceID    string
-	DevEUI      string // LoRaWAN devices only
-	MacAddress  string // IP/WiFi devices only
-	Provider    string
-	Timestamp   time.Time
+	SensorID    string // set post-decode from sensors.json/device_channels.json; empty when unregistered
+	// ModbusChannel is set (1-32) instead of SensorType by UC100/UC300 decoders,
+	// which cannot know a Modbus channel's real-world meaning — only site config
+	// (device_channels.json + sensors.json) does. A post-decode resolution step
+	// fills in SensorType/SensorID from it, or drops the record if the channel
+	// has no config entry. Zero for every other decoder.
+	ModbusChannel int
+	// IOChannel is the same idea as ModbusChannel, for UC300's fixed-hardware
+	// GPIO/PT100/ADC channels (raw channel_id byte, 3-14): what any of those
+	// pins is wired to is site config too, not something the decoder can name.
+	// Resolved the same way, via device_channels.json's io_channel field.
+	IOChannel  int
+	DevEUI     string // LoRaWAN devices only
+	MacAddress string // IP/WiFi devices only
+	Provider   string
+	Timestamp  time.Time
 }
 
 func NewFloat(sensorType, deviceModel, deviceID, provider string, value float64, ts time.Time) SensorDataRecord {
@@ -257,4 +272,17 @@ var ST = SensorTypes{
 	Temperature: "temperature", Latitude: "latitude", Longitude: "longitude",
 	MotionStatus: "motion_status", GeofenceStatus: "geofence_status",
 	DevicePosition: "device_position", TamperStatus: "tamper_status",
+}
+
+// AllSensorTypes returns every canonical sensor_type value defined on ST, for
+// validating externally-configured sensor_type references (e.g. sensors.json)
+// against the same vocabulary decoders use. Derived by reflection rather than
+// hand-maintained, so it can't drift out of sync with SensorTypes/ST.
+func AllSensorTypes() map[string]bool {
+	out := make(map[string]bool)
+	v := reflect.ValueOf(ST)
+	for i := 0; i < v.NumField(); i++ {
+		out[v.Field(i).String()] = true
+	}
+	return out
 }

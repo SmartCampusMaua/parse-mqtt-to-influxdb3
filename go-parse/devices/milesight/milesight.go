@@ -122,12 +122,25 @@ func ParseMilesightTLV(payload []byte) []TLV {
 }
 
 // Decode routes a Milesight payload to the registered model+submodel decoder.
+//
+// UC100/UC300 are special-cased before the generic ParseMilesightTLV call:
+// their Modbus channel is genuinely variable-length (driven by an embedded
+// data_type byte, not a static per-channel-type table) and needs its own
+// tokenizer — see uc.go.
 func Decode(deviceModel, deviceSubmodel string, payload []byte, deviceID, provider string, ts time.Time) []record.SensorDataRecord {
-	entries := ParseMilesightTLV(payload)
 	key := strings.ToUpper(strings.TrimSpace(deviceModel))
 	if sub := strings.ToUpper(strings.TrimSpace(deviceSubmodel)); sub != "" {
 		key += "_" + sub
 	}
+
+	switch key {
+	case "UC100":
+		return DecodeUC100(payload, deviceID, provider, ts)
+	case "UC300":
+		return DecodeUC300(payload, deviceID, provider, ts)
+	}
+
+	entries := ParseMilesightTLV(payload)
 	if decoder, ok := modelDecoders[key]; ok {
 		return decoder(entries, deviceID, provider, ts)
 	}
