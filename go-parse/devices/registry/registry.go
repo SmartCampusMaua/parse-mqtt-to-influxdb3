@@ -39,6 +39,18 @@ var lnsParsers = map[string]lnsParser{
 	"WS101": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
 		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
 	},
+	// WS101_SOS/WS101_SCENE: same wire protocol and decoder as WS101 (the
+	// button's color/purpose isn't reported in the payload) — split by
+	// device_model anyway, since it's a real hardware/deployment difference
+	// worth having as its own queryable InfluxDB tag (e.g. "alert on any SOS
+	// press across every SOS unit" without a per-device lookup). See
+	// devices.json's comment on this device for the rationale.
+	"WS101_SOS": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
+		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
+	},
+	"WS101_SCENE": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
+		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
+	},
 	"EM500_SMTC": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
 		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
 	},
@@ -58,6 +70,15 @@ var lnsParsers = map[string]lnsParser{
 		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
 	},
 	"UC300": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
+		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
+	},
+	"UC501": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
+		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
+	},
+	"UC511": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
+		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
+	},
+	"VS370": func(model, submodel string, payload []byte, deviceID, provider string, port uint64, ts time.Time) []record.SensorDataRecord {
 		return milesight.Decode(model, submodel, payload, deviceID, provider, ts)
 	},
 }

@@ -23,7 +23,7 @@ const dmUC300 = "uc300"
 
 // DecodeUC300 decodes UC300 binary payloads from LoRaWAN uplinks.
 func DecodeUC300(payload []byte, deviceID, provider string, ts time.Time) []record.SensorDataRecord {
-	return decodeUC300(ParseUCTLV(payload, uc300ChannelLengths), deviceID, provider, ts)
+	return decodeUC300(ParseUCTLV(payload, uc300ChannelLengths, isUC100300ModbusEntry, uc100300ModbusEntryLen), deviceID, provider, ts)
 }
 
 // uc300ChannelLengths: byte lengths only, sourced directly from the official

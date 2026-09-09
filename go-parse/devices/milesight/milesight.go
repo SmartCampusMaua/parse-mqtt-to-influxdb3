@@ -38,10 +38,11 @@ var genericTypeLengths = map[byte]int{
 // channelTypeOverride maps (channel, type) pairs that differ from the generic table.
 //
 // NOTE: channel 0x20 type 0xCE ("history") is intentionally only registered
-// once, for EM500-SWL below — EM500-SMTC (10B), VS373 (9B), and AT101 (12B)
+// once, for EM500-SWL below — EM500-SMTC (10B), VS373 (9B), AT101 (12B), and
+// UC511 (9B, coincidentally the same length as VS373 but a different shape)
 // all use the same (channel, type) pair with different, mutually-incompatible
 // lengths. ParseMilesightTLV has no model context (it runs before the model
-// is looked up), so this is not a benign omission: if any of those three
+// is looked up), so this is not a benign omission: if any of those four
 // ever sends a 0x20/0xCE TLV, it will be mis-consumed as EM500-SWL's 6
 // bytes, corrupting the parse of whatever follows it in that uplink — not a
 // clean "unknown channel, stop." History/backfill records are out of scope
@@ -77,6 +78,11 @@ var channelTypeOverride = map[[2]byte]int{
 	{0x04, 0x88}: 9, // location (normal report): lat(4B)+lon(4B)+status(1B)
 	{0x84, 0x88}: 9, // location (geofence/alarm report): lat(4B)+lon(4B)+status(1B)
 	{0x06, 0xD9}: 9, // wifi scan result: group(1B)+mac(6B)+rssi(1B)+motion(1B) — skipped
+
+	// UC511/UC512 (irrigation valve + pressure controller)
+	{0x09, 0x7B}: 2, // pressure: uint16 LE
+	{0xB9, 0x7B}: 1, // pressure_sensor_status: uint8
+	{0x21, 0xCE}: 6, // history pipe pressure: timestamp(4B)+pressure(2B) — skipped (safe: unclaimed pair, unlike 0x20/0xCE above)
 }
 
 type TLV struct {
@@ -88,12 +94,16 @@ type TLV struct {
 type modelDecoder func([]TLV, string, string, time.Time) []record.SensorDataRecord
 
 var modelDecoders = map[string]modelDecoder{
-	"EM300_DI":   decodeEM300DI,
-	"EM500_SWL":  decodeEM500SWL,
-	"EM500_SMTC": decodeEM500SMTC,
-	"WS101":      decodeWS101,
-	"VS373":      decodeVS373,
-	"AT101":      decodeAT101,
+	"EM300_DI":    decodeEM300DI,
+	"EM500_SWL":   decodeEM500SWL,
+	"EM500_SMTC":  decodeEM500SMTC,
+	"WS101":       decodeWS101,
+	"WS101_SOS":   decodeWS101SOS,
+	"WS101_SCENE": decodeWS101Scene,
+	"VS373":       decodeVS373,
+	"AT101":       decodeAT101,
+	"UC511":       decodeUC511,
+	"VS370":       decodeVS370,
 }
 
 // ParseMilesightTLV tokenizes a Milesight binary uplink into channel/type/data entries.
@@ -138,6 +148,8 @@ func Decode(deviceModel, deviceSubmodel string, payload []byte, deviceID, provid
 		return DecodeUC100(payload, deviceID, provider, ts)
 	case "UC300":
 		return DecodeUC300(payload, deviceID, provider, ts)
+	case "UC501":
+		return DecodeUC501(payload, deviceID, provider, ts)
 	}
 
 	entries := ParseMilesightTLV(payload)
@@ -151,4 +163,6 @@ func Decode(deviceModel, deviceSubmodel string, payload []byte, deviceID, provid
 func le16(b []byte) uint16   { return binary.LittleEndian.Uint16(b) }
 func le24(b []byte) uint32   { return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 }
 func le32(b []byte) uint32   { return binary.LittleEndian.Uint32(b) }
+func le64(b []byte) uint64   { return binary.LittleEndian.Uint64(b) }
 func f32le(b []byte) float64 { return float64(math.Float32frombits(binary.LittleEndian.Uint32(b))) }
+func f64le(b []byte) float64 { return math.Float64frombits(binary.LittleEndian.Uint64(b)) }

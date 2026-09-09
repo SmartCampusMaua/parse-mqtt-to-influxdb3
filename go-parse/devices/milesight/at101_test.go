@@ -26,8 +26,8 @@ func TestDecodeAT101(t *testing.T) {
 	if bat := got[st.BatteryLevel]; bat.ValueFloat == nil || *bat.ValueFloat != 90 {
 		t.Errorf("BatteryLevel: got %+v, want 90", bat)
 	}
-	if temp := got[st.Temperature]; temp.ValueFloat == nil || *temp.ValueFloat != 25.3 {
-		t.Errorf("Temperature: got %+v, want 25.3", temp)
+	if temp := got[st.AirTemp]; temp.ValueFloat == nil || *temp.ValueFloat != 25.3 {
+		t.Errorf("AirTemp: got %+v, want 25.3", temp)
 	}
 	if pos := got[st.DevicePosition]; pos.ValueInt == nil || *pos.ValueInt != 1 {
 		t.Errorf("DevicePosition: got %+v, want 1", pos)
@@ -48,11 +48,11 @@ func TestDecodeAT101_TemperatureAlarm(t *testing.T) {
 		got[r.SensorType] = r
 	}
 
-	if temp := got[st.Temperature]; temp.ValueFloat == nil || *temp.ValueFloat != 18.5 {
-		t.Errorf("Temperature: got %+v, want 18.5", temp)
+	if temp := got[st.AirTemp]; temp.ValueFloat == nil || *temp.ValueFloat != 18.5 {
+		t.Errorf("AirTemp: got %+v, want 18.5", temp)
 	}
-	if alarm := got[st.TemperatureAlarm]; alarm.ValueInt == nil || *alarm.ValueInt != 1 {
-		t.Errorf("TemperatureAlarm: got %+v, want 1", alarm)
+	if alarm := got[st.AirTempAlarm]; alarm.ValueInt == nil || *alarm.ValueInt != 1 {
+		t.Errorf("AirTempAlarm: got %+v, want 1", alarm)
 	}
 }
 

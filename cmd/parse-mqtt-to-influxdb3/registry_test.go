@@ -162,13 +162,14 @@ func TestGetSensorsMap_RejectsUnknownSensorType(t *testing.T) {
 	}
 }
 
-func TestGetSensorsMap_AllowsSameSensorTypeTwiceOnOneDevice(t *testing.T) {
-	// Two identical instruments on one RS485 bus — same sensor_type, distinct sensor_id.
+func TestGetSensorsMap_AllowsSameSensorTypeTwiceOnOneDeviceViaDeviceIndex(t *testing.T) {
+	// Two identical probes on one device — same sensor_type, distinct
+	// sensor_id, disambiguated by device_index.
 	path := writeTempFile(t, "sensors.json", `{
 		"version": "1",
 		"sensors": [
-			{"sensor_id": "`+testSensorID1+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"},
-			{"sensor_id": "`+testSensorID2+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"}
+			{"sensor_id": "`+testSensorID1+`", "sensor_type": "soil_moisture_raw", "device_id": "`+testDeviceIDUC300+`", "device_index": 1},
+			{"sensor_id": "`+testSensorID2+`", "sensor_type": "soil_moisture_raw", "device_id": "`+testDeviceIDUC300+`", "device_index": 2}
 		]
 	}`)
 
@@ -177,7 +178,45 @@ func TestGetSensorsMap_AllowsSameSensorTypeTwiceOnOneDevice(t *testing.T) {
 		t.Fatalf("GetSensorsMap: %v", err)
 	}
 	if len(sensorMap) != 2 {
-		t.Fatalf("expected 2 sensors (not unique on device_id+sensor_type), got %d", len(sensorMap))
+		t.Fatalf("expected 2 sensors (not unique on device_id+sensor_type alone), got %d", len(sensorMap))
+	}
+	if sensorMap[testSensorID1].DeviceIndex != 1 || sensorMap[testSensorID2].DeviceIndex != 2 {
+		t.Errorf("device_index not preserved: got %+v / %+v", sensorMap[testSensorID1], sensorMap[testSensorID2])
+	}
+}
+
+func TestGetSensorsMap_RejectsDuplicateDeviceIndexTuple(t *testing.T) {
+	// Same device_id+sensor_type+device_index (both default to 0) claimed by
+	// two different sensor_ids — a genuine config error, not legitimate
+	// multi-instance disambiguation.
+	path := writeTempFile(t, "sensors.json", `{
+		"version": "1",
+		"sensors": [
+			{"sensor_id": "`+testSensorID1+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"},
+			{"sensor_id": "`+testSensorID2+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"}
+		]
+	}`)
+
+	if _, err := GetSensorsMap(path); err == nil {
+		t.Fatal("expected error for duplicate device_id/sensor_type/device_index tuple, got nil")
+	}
+}
+
+func TestGetSensorsMap_LoadsSensorName(t *testing.T) {
+	path := writeTempFile(t, "sensors.json", `{
+		"version": "1",
+		"sensors": [
+			{"sensor_id": "`+testSensorID1+`", "sensor_type": "soil_moisture_raw", "device_id": "`+testDeviceIDUC300+`", "device_index": 1, "sensor_name": "Depth 10cm"}
+		]
+	}`)
+
+	sensorMap, err := GetSensorsMap(path)
+	if err != nil {
+		t.Fatalf("GetSensorsMap: %v", err)
+	}
+	got := sensorMap[testSensorID1]
+	if got.SensorName != "Depth 10cm" {
+		t.Errorf("SensorName: got %q, want %q", got.SensorName, "Depth 10cm")
 	}
 }
 
@@ -319,17 +358,20 @@ func TestBuildSensorIndex_ResolvesUniquePairs(t *testing.T) {
 	if len(index) != 2 {
 		t.Fatalf("expected 2 index entries, got %d", len(index))
 	}
-	if got := index[sensorIndexKey(testDeviceIDUC300, "water_level")]; got != testSensorID1 {
+	if got := index[sensorIndexKey(testDeviceIDUC300, "water_level", 0)]; got != testSensorID1 {
 		t.Errorf("water_level lookup: got %q, want %q", got, testSensorID1)
 	}
-	if got := index[sensorIndexKey(testDeviceIDUC100, "battery_level")]; got != testSensorID4 {
+	if got := index[sensorIndexKey(testDeviceIDUC100, "battery_level", 0)]; got != testSensorID4 {
 		t.Errorf("battery_level lookup: got %q, want %q", got, testSensorID4)
 	}
 }
 
 func TestBuildSensorIndex_SkipsAmbiguousPairs(t *testing.T) {
-	// Two identical instruments sharing device_id+sensor_type can't be told
-	// apart by sensor_type alone — must be left out of the index entirely.
+	// Two instruments sharing device_id+sensor_type+device_index (both 0,
+	// i.e. neither sets one) can't be told apart — must be left out of the
+	// index entirely. GetSensorsMap would normally reject this at load time
+	// (duplicate tuple); buildSensorIndex doesn't re-trust that, so this
+	// exercises its own defensive skip.
 	sensorMap := map[string]SensorConfig{
 		testSensorID1: {SensorType: "water_level", DeviceID: testDeviceIDUC300},
 		testSensorID2: {SensorType: "water_level", DeviceID: testDeviceIDUC300},
@@ -340,11 +382,37 @@ func TestBuildSensorIndex_SkipsAmbiguousPairs(t *testing.T) {
 	if len(index) != 1 {
 		t.Fatalf("expected only the unambiguous pair to be indexed, got %d entries: %+v", len(index), index)
 	}
-	if _, ok := index[sensorIndexKey(testDeviceIDUC300, "water_level")]; ok {
+	if _, ok := index[sensorIndexKey(testDeviceIDUC300, "water_level", 0)]; ok {
 		t.Error("expected ambiguous water_level pair to be excluded from index")
 	}
-	if got := index[sensorIndexKey(testDeviceIDUC100, "battery_level")]; got != testSensorID4 {
+	if got := index[sensorIndexKey(testDeviceIDUC100, "battery_level", 0)]; got != testSensorID4 {
 		t.Errorf("battery_level lookup: got %q, want %q", got, testSensorID4)
+	}
+}
+
+func TestBuildSensorIndex_DeviceIndexDisambiguatesSharedSensorType(t *testing.T) {
+	// Three soil-moisture probes on one device, same sensor_type, told apart
+	// by device_index — this is exactly the case DeviceIndex exists for.
+	sensorMap := map[string]SensorConfig{
+		testSensorID1: {SensorType: "soil_moisture_raw", DeviceID: testDeviceIDUC300, DeviceIndex: 1},
+		testSensorID2: {SensorType: "soil_moisture_raw", DeviceID: testDeviceIDUC300, DeviceIndex: 2},
+		testSensorID3: {SensorType: "soil_moisture_raw", DeviceID: testDeviceIDUC300, DeviceIndex: 3},
+	}
+
+	index := buildSensorIndex(sensorMap)
+	if len(index) != 3 {
+		t.Fatalf("expected all 3 to resolve uniquely via device_index, got %d entries: %+v", len(index), index)
+	}
+	cases := []struct {
+		deviceIndex int
+		want        string
+	}{
+		{1, testSensorID1}, {2, testSensorID2}, {3, testSensorID3},
+	}
+	for _, c := range cases {
+		if got := index[sensorIndexKey(testDeviceIDUC300, "soil_moisture_raw", c.deviceIndex)]; got != c.want {
+			t.Errorf("device_index %d: got %q, want %q", c.deviceIndex, got, c.want)
+		}
 	}
 }
 

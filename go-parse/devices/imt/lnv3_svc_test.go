@@ -23,22 +23,27 @@ func TestDecodeLNV3SVC(t *testing.T) {
 	records := DecodeLNV3SVC(payload, "dev-1", "chirpstackv4", time.Now())
 
 	st := record.ST
-	got := map[string]record.SensorDataRecord{}
+	byIndex := map[int]record.SensorDataRecord{} // solenoid_valve_raw: DeviceIndex -> record
+	got := map[string]record.SensorDataRecord{}  // everything else: SensorType -> record
 	for _, r := range records {
+		if r.SensorType == st.SolenoidValveRaw {
+			byIndex[r.DeviceIndex] = r
+			continue
+		}
 		got[r.SensorType] = r
 	}
 
 	cases := []struct {
-		name string
-		sv   string
-		want int64
+		name        string
+		deviceIndex int
+		want        int64
 	}{
-		{"SV1", st.SV1, 2000},
-		{"SV2", st.SV2, 1000},
-		{"SV3", st.SV3, 1600},
+		{"valve 1", 1, 2000},
+		{"valve 2", 2, 1000},
+		{"valve 3", 3, 1600},
 	}
 	for _, c := range cases {
-		r, ok := got[c.sv]
+		r, ok := byIndex[c.deviceIndex]
 		if !ok || r.ValueInt == nil {
 			t.Fatalf("%s: no int record, got %+v", c.name, r)
 		}
@@ -73,18 +78,23 @@ func TestDecodeLNV3SVC_RealPayload(t *testing.T) {
 	records := DecodeLNV3SVC(payload, "dev-1", "chirpstackv4", time.Now())
 
 	st := record.ST
+	byIndex := map[int]record.SensorDataRecord{}
 	got := map[string]record.SensorDataRecord{}
 	for _, r := range records {
+		if r.SensorType == st.SolenoidValveRaw {
+			byIndex[r.DeviceIndex] = r
+			continue
+		}
 		got[r.SensorType] = r
 	}
 
-	for _, sv := range []string{st.SV1, st.SV2, st.SV3} {
-		r, ok := got[sv]
+	for _, deviceIndex := range []int{1, 2, 3} {
+		r, ok := byIndex[deviceIndex]
 		if !ok || r.ValueInt == nil {
-			t.Fatalf("%s: no int record, got %+v", sv, r)
+			t.Fatalf("device_index %d: no int record, got %+v", deviceIndex, r)
 		}
 		if *r.ValueInt != 0 {
-			t.Errorf("%s: got %d, want 0", sv, *r.ValueInt)
+			t.Errorf("device_index %d: got %d, want 0", deviceIndex, *r.ValueInt)
 		}
 	}
 

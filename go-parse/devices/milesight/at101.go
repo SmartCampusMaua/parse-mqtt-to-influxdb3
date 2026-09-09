@@ -17,12 +17,12 @@ func decodeAT101(entries []TLV, deviceID, provider string, ts time.Time) []recor
 			out = append(out, record.NewFloat(st.BatteryLevel, dm, deviceID, provider, float64(e.Data[0]), ts))
 
 		case e.Channel == 0x03 && e.Type == 0x67:
-			out = append(out, record.NewFloat(st.Temperature, dm, deviceID, provider, float64(int16(le16(e.Data)))/10.0, ts))
+			out = append(out, record.NewFloat(st.AirTemp, dm, deviceID, provider, float64(int16(le16(e.Data)))/10.0, ts))
 
 		// temperature + abnormal alarm: temp(2B)+alarm(1B, 0=normal 1=abnormal)
 		case e.Channel == 0x83 && e.Type == 0x67:
-			out = append(out, record.NewFloat(st.Temperature, dm, deviceID, provider, float64(int16(le16(e.Data[0:2])))/10.0, ts))
-			out = append(out, record.NewInt(st.TemperatureAlarm, dm, deviceID, provider, int64(e.Data[2]), ts))
+			out = append(out, record.NewFloat(st.AirTemp, dm, deviceID, provider, float64(int16(le16(e.Data[0:2])))/10.0, ts))
+			out = append(out, record.NewInt(st.AirTempAlarm, dm, deviceID, provider, int64(e.Data[2]), ts))
 
 		// location (0x04 normal report, 0x84 geofence/alarm report): lat(4B)+lon(4B)+status(1B)
 		// status low nibble = motion_status, high nibble = geofence_status

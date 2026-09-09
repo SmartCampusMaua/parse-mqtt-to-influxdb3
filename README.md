@@ -35,6 +35,9 @@ to an InfluxDB3 Core instance.
 | `"lnv3_svc"`                    | `lnv3_svc`                       |
 | `"uc100"`                       | `uc100`                          |
 | `"uc300"`                       | `uc300`                          |
+| `"uc501"`                       | `uc501`                          |
+| `"uc511"`                       | `uc511`                          |
+| `"vs370"`                       | `vs370`                          |
 
 This single merged tag eliminates a redundant index dimension. Queries are
 `WHERE device_model = 'em300_di'`; to match all EM500 variants use
@@ -44,47 +47,30 @@ This single merged tag eliminates a redundant index dimension. Queries are
 
 `**` `sensor_id` is written only when the record resolves to an entry in
 [`sensors.json`](#sensor-registry-sensorsjson) — every non-UC decoder resolves
-it by `(device_id, sensor_type)`; UC100/UC300 resolve it by Modbus channel via
+it by `(device_id, sensor_type, device_index)`; UC100/UC300/UC501 resolve it
+by Modbus/IO channel via
 [`device_channels.json`](#device-channel-registry-device_channelsjson). Empty
 when unregistered.
 
 ### `raw` — audit measurement in `audit_iot` database
 
-| element     | value                                          |
-| ----------- | ----------------------------------------------- |
-| measurement | `raw`                                          |
-| tags        | `device_id`, `event_type = "payload_ingest"`   |
-| fields      | `raw_data` (string ≤ 512 chars)                |
-| timestamp   | ingestion time (time.Now() at message receipt) |
+| element     | value                                                    |
+| ----------- | --------------------------------------------------------- |
+| measurement | `raw`                                                    |
+| tags        | `device_id`, `asset_id`\*, `event_type = "payload_ingest"` |
+| fields      | `raw_data` (string ≤ 512 chars)                          |
+| timestamp   | ingestion time (time.Now() at message receipt)           |
 
-### `sensor_calibration` — written at startup and on every registry reload
+\* `asset_id` is a snapshot of whichever asset the device was assigned to at
+that instant (see [assets.json](#asset-registry-assetsjson)) — omitted when
+unassigned. `raw` is already a continuous, timestamped record of every
+message, so the full assignment history is reconstructable from it without
+any separate change-tracking.
 
-| element     | value                                              |
-| ----------- | --------------------------------------------------- |
-| measurement | `sensor_calibration`                               |
-| tags        | `device_id`, `sensor_type`                         |
-| fields      | `scale` (float), `offset` (float), `power` (float) |
-
-Formula applied by consumers at query time: `calibrated = (raw ^ power) × scale + offset`
-
-`writeCalibrations` (main.go) diffs against the **latest existing row** per
-`(device_id, sensor_type)` — queried via `fetchLatestCalibrations` — and only
-writes rows whose values actually changed. This makes it safe to call on
-every `DEVICE_REGISTRY_REFRESH_SEC` reload (so a `calibrations` edit in
-`devices.json` takes effect without a restart) without appending a duplicate
-row every time nothing changed. Before this, every process restart wrote a
-full duplicate set unconditionally — degrading the read-time run-length
-encoding the timeseries API relies on (calibration fields are meant to
-appear once per stream, not once per restart).
-
-This exists specifically for values that are a **cloud-side calibration
-curve** applied to a **raw device reading**, not a device measurement in its
-own right — e.g. `lnv3_sm3dl`'s `smdl1/2/3` (raw ADC counts from a soil probe;
-the moisture-% curve is per-probe and can be recalibrated without touching
-historical data) or a water-meter's pulse-to-volume ratio. Decoders write the
-raw value to `sensor_data` and the transform to `sensor_calibration` — never
-apply the transform in Go and throw away the raw value, because that bakes a
-possibly-wrong calibration into history permanently.
+`sensor_data` and `raw` always hold exactly the value transmitted by the
+sensor, untouched — no calibration or unit-conversion happens anywhere in
+this pipeline. That's a client-side/user-space concern applied by whatever
+consumes the SmartCampusMaua API, not by this repo or the API server.
 
 ---
 
@@ -94,7 +80,7 @@ Four InfluxDB3 databases are initialised simultaneously on the same host and tok
 
 | database            | content                             |
 | -------------------- | ------------------------------------ |
-| `iot_sensors`       | `sensor_data`, `sensor_calibration` |
+| `iot_sensors`       | `sensor_data`                       |
 | `audit_iot`         | `raw` (LoRaWAN / MQTT audit log)    |
 | `vehicle_telemetry` | vehicle GPS/CAN telemetry           |
 | `audit_vehicle`     | raw vehicle audit log               |
@@ -110,11 +96,11 @@ Four InfluxDB3 databases are initialised simultaneously on the same host and tok
 │                              GetAssetsMap (loads + reloads assets.json)
 │                              GetSensorsMap (loads + reloads sensors.json)
 │                              GetDeviceChannelsMap (loads + reloads device_channels.json)
-│                              resolveChannelRecord (UC100/UC300 channel → sensor resolution)
-├── devices.json               Runtime device registry (model/devEui/calibrations)
+│                              resolveChannelRecord (UC100/UC300/UC501 channel → sensor resolution)
+├── devices.json               Runtime device registry (model/devEui)
 ├── assets.json                Runtime asset registry (asset_id/coords/device_ids)
-├── sensors.json                Runtime sensor registry (sensor_id/sensor_type/device_id)
-├── device_channels.json        Runtime UC100/UC300 Modbus/GPIO channel routing
+├── sensors.json                Runtime sensor registry (sensor_id/sensor_type/device_index)
+├── device_channels.json        Runtime UC-series Modbus/IO channel routing
 ├── record/
 │   └── record.go              SensorDataRecord · SensorTypes singleton (ST)
 └── go-parse/
@@ -134,9 +120,12 @@ Four InfluxDB3 databases are initialised simultaneously on the same host and tok
         │   ├── ws101.go       WS101 smart button decoder
         │   ├── vs373.go       VS373 bed/room presence & vital signs decoder
         │   ├── at101.go       AT101 GPS/WiFi asset tracker decoder
-        │   ├── uc.go          ParseUCTLV — shared UC100/UC300 tokenizer (Modbus is variable-length)
+        │   ├── uc.go          ParseUCTLV — shared UC100/UC300/UC501 tokenizer (Modbus is variable-length)
         │   ├── uc100.go       UC100 Modbus-only decoder
-        │   └── uc300.go       UC300 Modbus + fixed GPIO/PT100/ADC decoder (channel-routed, see below)
+        │   ├── uc300.go       UC300 Modbus + fixed GPIO/PT100/ADC decoder (channel-routed, see below)
+        │   ├── uc501.go       UC501/UC50x Modbus + site-wired GPIO/analog-input decoder (channel-routed)
+        │   ├── uc511.go       UC511/UC512 irrigation valve + pipe-pressure decoder (fixed-purpose, no RS485)
+        │   └── vs370.go       VS370 single-zone occupancy/illuminance presence sensor decoder
         ├── imt/
         │   ├── imt.go         parseIMT (tag-based protocol, not TLV) · Decode(model, submodel, ...)
         │   ├── lnv3_sm3dl.go  LoraNodeV3 soil moisture (3 depth levels) decoder
@@ -175,6 +164,9 @@ Each file owns exactly one device codec. Naming pattern: **`model_submodel.go`**
 | `imt/lnv3_svc.go`            | `"LNV3_SVC"`        | `"LNV3_SVC"`        | `DecodeLNV3SVC`        |
 | `milesight/uc100.go`         | `"UC100"`           | `"UC100"`           | `DecodeUC100`          |
 | `milesight/uc300.go`         | `"UC300"`           | `"UC300"`           | `DecodeUC300`          |
+| `milesight/uc501.go`         | `"UC501"`           | `"UC501"`           | `DecodeUC501`          |
+| `milesight/uc511.go`         | `"UC511"`           | `"UC511"`           | `DecodeUC511`          |
+| `milesight/vs370.go`         | `"VS370"`           | `"VS370"`           | `DecodeVS370`          |
 
 **Adding a new device** (example: a new Milesight TLV-protocol device `EM310-TILT`):
 
@@ -186,6 +178,10 @@ Each file owns exactly one device codec. Naming pattern: **`model_submodel.go`**
 5. In `record.go`: reuse an existing `SensorTypes` field where the physical
    quantity and unit already match (e.g. `battery_level`); add a new field
    only when nothing fits. Follow the [naming convention](#naming-convention-for-sensor_type) below.
+   If the device reports more than one instance of the same physical
+   quantity (e.g. multiple probes/valves), set `SensorDataRecord.DeviceIndex`
+   per instance instead of baking an index into the `sensor_type` name — see
+   the `DeviceIndex` rule in the naming convention section.
 
 **Rules:**
 
@@ -197,10 +193,15 @@ Each file owns exactly one device codec. Naming pattern: **`model_submodel.go`**
   sequential-tag protocol instead of `[channel][type][data]` TLVs. The
   per-device decoder files still follow the same one-file-per-codec shape;
   only the shared parser underneath differs.
-- Prefer emitting the **raw** device value and pushing any curve-fit/scale
-  correction into `sensor_calibration` (see above) over hardcoding a
-  correction constant in Go, whenever that correction is something that
-  could reasonably be recalibrated later without a code change.
+- Always emit the **raw** device value, untouched — never apply a curve-fit/
+  scale correction in Go. That's a client-side/user-space concern for
+  whatever consumes the SmartCampusMaua API, not something this pipeline
+  computes or stores.
+- If a channel's real-world meaning genuinely can't be known by the decoder
+  (site-wired RS485/GPIO, e.g. UC100/UC300/UC501) rather than merely being
+  multi-instance, use `ModbusChannel`/`IOChannel` + `device_channels.json`
+  instead of `DeviceIndex` — see the [naming convention](#naming-convention-for-sensor_type)
+  section for the distinction between the two mechanisms.
 
 ---
 
@@ -211,12 +212,14 @@ devices.json     assets.json    sensors.json         device_channels.json
   → GetDevicesMap() → GetAssetsMap() → GetSensorsMap()  → GetDeviceChannelsMap()
     deviceMap[..]=     deviceID ->      sensorMap[sensorID]  deviceChannels[deviceID]
     DeviceConfig       AssetConfig      = {SensorType,        = {Modbus[chn]->sensorID,
-                                            DeviceID}             IO[chn]->sensorID}
+                                            DeviceID,             IO[chn]->sensorID}
+                                            DeviceIndex,
+                                            SensorName}
         ↓                   ↓                  ↓                        ↓
   mergeAssetInfo()    buildSensorIndex(sensorMap)
-  backfills asset      → sensorIndex[deviceID+sensorType] = sensorID
-  info onto             (skips ambiguous device_id+sensor_type pairs —
-  DeviceConfig            those need channel-based resolution instead)
+  backfills asset      → sensorIndex[deviceID+sensorType+deviceIndex] = sensorID
+  info onto             (deviceIndex=0 for every single-instance sensor_type —
+  DeviceConfig            behaves exactly like the old deviceID+sensorType key)
 
 MQTT message arrives on  device/<identifier>/telemetry
   → detectProvider()           → "chirpstackv4" | "everynet" | "custom"
@@ -226,13 +229,15 @@ MQTT message arrives on  device/<identifier>/telemetry
       → lookupKeys() = ["MODEL_SUBMODEL", "MODEL"]   (submodel key tried first)
       → lnsParsers["MODEL_SUBMODEL"]  → vendor.Decode()
           → vendor binaryDecoders["MODEL_SUBMODEL"]  → decodeXxx()
-              → []SensorDataRecord   (UC100/UC300: ModbusChannel or IOChannel set, SensorType empty)
+              → []SensorDataRecord   (UC100/300/501: ModbusChannel or IOChannel set, SensorType empty;
+                                       everything else: SensorType set directly, DeviceIndex set when
+                                       the device carries more than one sensor of that type)
   → per record, in parseDeviceModel:
       → ModbusChannel/IOChannel != 0?  resolveChannelRecord(): deviceChannels[deviceID].Modbus/.IO[chn]
                                         → sensorID → sensorMap[sensorID].SensorType
                                         → no config entry? record dropped (logged), never written
                                           under an empty/made-up sensor_type
-      → otherwise:                     sensorIndex[deviceID+sensorType] → SensorID (if registered)
+      → otherwise:                     sensorIndex[deviceID+sensorType+deviceIndex] → SensorID (if registered)
   → writeSensorRecords()
       → device_model tag = lowercase(model + "_" + submodel)
       → sensor_data point per record (sensor_id tag set when resolved) → InfluxDB3 iot_sensors
@@ -261,27 +266,68 @@ _parameter_ uses the standard domain abbreviation when one is established:
 | Use WMO/ISO symbol                                        | `air_rh` (RH = relative humidity symbol)                       |
 | Drop suffix when root is unambiguous                      | `air_press` (`press·ure`), `solar_rad` (`rad·iation`)          |
 | Keep full word when no shorter standard exists            | `illuminance`, `wind_speed`, `water_level`                     |
-| Enumerated/indexed components: digit directly on the base, **no underscore before it** | `sv1`/`sv2`/`sv3`, `smdl1`/`smdl2`/`smdl3`, `voltage_u1`, `power_p1`, `region1_occupancy` |
+| `_raw` suffix: value needs client-side calibration to be physically meaningful | `soil_moisture_raw` (raw ADC), vs. `soil_moisture` (already scaled on-device by `em500_smtc`) — see below |
+| Legacy indexed components (pre-`DeviceIndex`): digit directly on the base, **no underscore before it** | `voltage_u1`, `power_p1`, `region1_occupancy` |
 
-The indexed-component rule is a single sitewide convention, not
-per-device — verified by auditing every existing indexed family
-(`voltage_u1/2/3/12/23/31`, `current_i1/2/3`, `power_p1/2/3`, `power_q1/2/3`,
-`power_s1/2/3`, `c1_state`/`c2_state` all already used no underscore).
-`power_factor1/2/3` and `digital_input1/2` were the only two exceptions
-found (they used `power_factor_1`/`digital_input_1`); since neither was in
-live use yet, both were normalized rather than adding a third variant.
+**The `_raw` suffix rule.** A `_raw`-suffixed name and its non-`_raw`
+counterpart are **two different measurements**, not two names for the same
+one — never merge them under a single `sensor_type` even when they describe
+the same physical thing. `solenoid_valve_raw` (uncalibrated ADC, `lnv3_svc`
+only) and `solenoid_valve_status` (the actual open/closed reading, reported
+directly by `uc511` — its firmware does the ADC-to-status decision on-device,
+so `uc511` has no raw signal to expose at all; `lnv3_svc` has no status
+counterpart, since turning its raw reading into open/closed is a client-side
+concern, not something this pipeline computes) is the clearest example: same
+physical valve, genuinely different wire-level information.
+
+**Indexing: `DeviceIndex` (new devices), not a baked-in digit (legacy).**
+Every *new* device family added after this rule was adopted uses a single
+generic `sensor_type` plus `SensorDataRecord.DeviceIndex` to tell multiple
+same-type sensors on one device apart (e.g. `lnv3_sm3dl`'s three
+`soil_moisture_raw` probes are `device_index` 1/2/3, not `smdl1/2/3`).
+`DeviceIndex` is purely a **resolution key** — it disambiguates which
+`sensor_id` a reading belongs to via `sensors.json`'s own `device_index`
+field, and is **never written to InfluxDB3**; once `sensor_id` is resolved
+it has done its only job. This is a different mechanism from
+`ModbusChannel`/`IOChannel` (UC100/300/501): those exist because the
+decoder *can't know* what a channel means at all (pure site config); `DeviceIndex`
+exists for decoders that already know the physical quantity and position,
+just need help telling same-type instances apart. The **legacy indexed
+families** below (`voltage_u1/2/3` etc., from `ks3000_lora`/`ks3000_wifi`,
+already shipped before this rule existed) keep their baked-in digits — they
+were **not** retroactively migrated to `DeviceIndex`, since that would
+rename `sensor_type` tag values already written to InfluxDB3 for live
+devices; only genuinely new device families adopt the new pattern.
+`power_factor1/2/3` and `digital_input1/2` were the only pre-existing
+`sensor_type`s ever renamed outside a new-device addition — both because
+neither had ever been emitted by any decoder yet (no live data to break):
+first `power_factor_1`→`power_factor1` (dropped the underscore, joining the
+sitewide legacy-indexing convention), then `digital_input1`/`digital_input2`
+→ a single `digital_input` + `DeviceIndex` (joining the new pattern, once it
+existed) when `uc511.go` needed the same concept.
 
 `sensor_type` values are reused **across devices** when the physical
-quantity and unit genuinely match — `battery_level` and `temperature_alarm`
-each appear on more than one device family below. `device_model` is what
-disambiguates a reused tag's exact semantics when they differ slightly
-(e.g. `temperature_alarm`'s enum codes differ between `em500_smtc` and
-`at101` — see the table for each). `electrical_conductivity` is currently
+quantity and unit genuinely match — `battery_level` appears on more than one
+device family below, and `air_temp` similarly covers `at101`'s ambient
+reading alongside `nit21li_emw104`/`em300_di`'s.
+
+`temperature_alarm` used to be reused this way too, but it wasn't a genuine
+match: `em500_smtc`'s version is a **soil**-temperature alarm (emitted
+alongside `soil_temp`, from its soil probe) while `at101`'s is an
+**ambient**-air alarm — only the enum *shape* matched, not the physical
+quantity. Split into `soil_temp_alarm` and `air_temp_alarm` respectively.
+Like `power_factor1/2/3`/`digital_input1/2` above, this is a rename outside
+a new-device addition — unlike those, though, live historical data already
+exists under the old `temperature`/`temperature_alarm` tags for `at101` and
+`em500_smtc`; only writes from the rename forward use the new names, so a
+query spanning that boundary needs to account for both.
+
+`electrical_conductivity` is currently
 emitted by `em500_smtc` only, despite `record.go`'s field comment grouping
 it with `em500_swl` — that grouping describes the shared "Water / soil"
 struct section, not actual reuse; `em500_swl.go` never writes it.
 
-Ten `SensorTypes` fields exist in `record.go` but are currently **not
+`SensorTypes` fields that exist in `record.go` but are currently **not
 emitted by any decoder** — grep `st.<Field>` across `go-parse/devices/` to
 re-verify before relying on any of these:
 
@@ -289,9 +335,10 @@ re-verify before relying on any of these:
   firmware's raw water-conversion channel, which is parsed but only used
   internally to compute `pulse_count`; the conversion factors themselves
   aren't written out today.
-- `digital_input1`, `digital_input2`, `interrupt_level`, `interrupt_status`
-  — standardised DTL200-SWL I/O names, not emitted by `dtl200.go`; reserved
-  for a probe variant that reads those pins.
+- `digital_input`, `interrupt_level`, `interrupt_status` — standardised
+  DTL200-SWL I/O names, not emitted by `dtl200.go`; reserved for a probe
+  variant that reads those pins. (`digital_input` is also emitted by
+  `uc511.go` — the field is shared, `dtl200.go` just doesn't use it yet.)
 - `battery_voltage` — distinct from `battery_level` (%); no decoder emits a
   raw battery voltage today (Khomp NIT21LI emits `internal_battery_voltage`
   instead, a different field).
@@ -417,7 +464,7 @@ ambiguous with "not reported."
 | `soil_moisture`        | %       | float      | Soil moisture (old ÷2 or new ÷100 resolution channel, unified) |
 | `electrical_conductivity` | µS/cm   | int        | Raw electrical conductivity reading                          |
 | `temperature_mutation` | °C      | float      | Temperature delta reported alongside a mutation alarm       |
-| `temperature_alarm`    | —       | int (enum) | `0` release · `1` threshold · `2` mutation                  |
+| `soil_temp_alarm`      | —       | int (enum) | `0` release · `1` threshold · `2` mutation                  |
 
 Sensor-fault sentinels (`0xFFFF`/`0xFFFD`) on temperature/moisture/EC
 channels are logged and the point is skipped, matching `em500_swl`.
@@ -439,7 +486,7 @@ expects (likely downlink acks); nothing is logged when this triggers.
 | `voltage_input` | V            | float      | 0–30 V analog voltage input             |
 | `water_level`   | m / MPa / Pa | float      | Calculated value (probe-mode dependent), only written for probe modes 0x00-0x02 |
 
-`digital_input1/2`, `interrupt_level`, `interrupt_status` are defined as
+`digital_input`, `interrupt_level`, `interrupt_status` are defined as
 standardised DTL200-SWL I/O names in `record.go` but are not currently
 emitted by `dtl200.go` — reserved for a probe variant that reads those pins.
 
@@ -497,8 +544,8 @@ them.
 | sensor_type        | unit | value type | description                                                        |
 | ---------------------- | ------ | ------------ | ---------------------------------------------------------------------- |
 | `battery_level`     | %    | float      | Battery charge percentage                                          |
-| `temperature`       | °C   | float      | Ambient temperature (plain channel or the temp+alarm channel)      |
-| `temperature_alarm` | —    | int (enum) | `0` normal · `1` abnormal                                          |
+| `air_temp`          | °C   | float      | Ambient temperature (plain channel or the temp+alarm channel); shared tag with `nit21li_emw104`/`em300_di` |
+| `air_temp_alarm`    | —    | int (enum) | `0` normal · `1` abnormal                                          |
 | `latitude`          | °    | float      | GPS/WiFi-resolved latitude, up to 6 decimal places (from normal `0x04` or alarm/geofence `0x84` report); not written when the device has no fix yet — see below |
 | `longitude`         | °    | float      | GPS/WiFi-resolved longitude, same precision/fix caveat as `latitude`  |
 | `motion_status`     | —    | int (enum) | `0` unknown · `1` start · `2` moving · `3` stop                     |
@@ -528,62 +575,78 @@ described in the VS373 section above.
 
 Uses IMT's tag-based protocol (`imt/imt.go`), not Milesight TLV.
 
-| sensor_type     | unit | value type | description                                                    |
-| ------------------ | ------ | ------------ | ------------------------------------------------------------------ |
-| `smdl1`         | raw  | int        | Raw ADC reading, probe depth 1 (nominally 10 cm)                |
-| `smdl2`         | raw  | int        | Raw ADC reading, probe depth 2 (nominally 30 cm)                |
-| `smdl3`         | raw  | int        | Raw ADC reading, probe depth 3 (nominally 70 cm)                |
-| `board_voltage` | V    | float      | Board supply voltage                                            |
+| sensor_type          | device_index | unit | value type | description                          |
+| ----------------------- | -------------- | ------ | ------------ | ---------------------------------------- |
+| `soil_moisture_raw`  | 1            | raw  | int        | Raw ADC reading, probe depth 1 (nominally 10 cm) |
+| `soil_moisture_raw`  | 2            | raw  | int        | Raw ADC reading, probe depth 2 (nominally 30 cm) |
+| `soil_moisture_raw`  | 3            | raw  | int        | Raw ADC reading, probe depth 3 (nominally 70 cm) |
+| `board_voltage`      | —            | V    | float      | Board supply voltage                     |
 
-`smdl1/2/3` are intentionally **raw**, not a computed moisture percentage —
-the conversion (`15000 × raw^power`, scaled per depth) is a per-probe
-calibration curve stored in `sensor_calibration` via each device's
-`calibrations` entry in `devices.json` (`power=-0.8`, `scale` folded from
-the depth-specific divisor), not hardcoded in the decoder. See the
-`sensor_calibration` section above for why.
+`soil_moisture_raw` is intentionally **raw**, not a computed moisture
+percentage — the conversion (`15000 × raw^power`, scaled per depth) is a
+client-side/user-space concern applied by whatever consumes the
+SmartCampusMaua API, not hardcoded in the decoder or computed anywhere in
+this pipeline. (Formerly `smdl1/2/3` — renamed + indexed as part of the
+`DeviceIndex` migration; see the
+[naming convention](#naming-convention-for-sensor_type) section.)
 
 ### `lnv3_svc` — solenoid valve control (IMT LoraNodeV3-SVC)
 
-| sensor_type     | unit | value type | description                                      |
-| ------------------ | ------ | ------------ | ----------------------------------------------------- |
-| `sv1`           | raw  | int        | Raw ADC reading, solenoid valve channel 1             |
-| `sv2`           | raw  | int        | Raw ADC reading, solenoid valve channel 2             |
-| `sv3`           | raw  | int        | Raw ADC reading, solenoid valve channel 3             |
-| `pulse_count`   | —    | int        | Solenoid actuation counter (reuses the same sensor_type as EM300-DI's pulse counter) |
-| `board_voltage` | V    | float      | Board supply voltage                                  |
+| sensor_type              | device_index | unit | value type | description                          |
+| --------------------------- | -------------- | ------ | ------------ | ---------------------------------------- |
+| `solenoid_valve_raw`     | 1/2/3        | raw  | int        | Raw ADC reading, one per valve channel   |
+| `pulse_count`            | —            | —    | int        | Solenoid actuation counter (reuses the same sensor_type as EM300-DI's pulse counter) |
+| `board_voltage`          | —            | V    | float      | Board supply voltage                     |
 
-`sv1/2/3` are raw, like `lnv3_sm3dl`'s `smdl1/2/3` — the open/closed
-decision is a threshold applied downstream via `sensor_calibration`
-(`offset=-1500`, `scale=1`, `power=1`; `calibrated = raw - 1500`, open when
-`calibrated > 0`), so the threshold can be recalibrated without reprocessing
-history.
+`solenoid_valve_raw` is raw, like `lnv3_sm3dl`'s `soil_moisture_raw` (formerly
+`sv1/2/3`) — `decodeLNV3SVC` only ever produces the raw ADC reading. The
+open/closed decision is a client-side/user-space concern applied by whatever
+consumes the SmartCampusMaua API; this pipeline doesn't compute or store it.
+`uc511` is a different device with its own on-device open/closed status —
+see the [naming convention](#naming-convention-for-sensor_type) section for
+why `solenoid_valve_status` still exists as a `sensor_type`, just not for
+`lnv3_svc`.
 
-### `uc100` / `uc300` — RS485/Modbus controller (Milesight UC100/UC300)
+### `uc100` / `uc300` / `uc501` — RS485/Modbus controller (Milesight UC-series)
 
 **No fixed `sensor_type` table** — unlike every other device above, what a
-Modbus channel (or, on UC300, a GPIO/PT100/ADC pin) measures is entirely
-site configuration, not something the decoder can know. `decodeUC100`/
-`decodeUC300` extract `(ModbusChannel, value)` or `(IOChannel, value)` pairs
-only; `sensor_type` and `sensor_id` are filled in afterward by
-`resolveChannelRecord` (main.go) from [`device_channels.json`](#device-channel-registry-device_channelsjson)
+Modbus channel (or, on UC300/UC501, a GPIO/analog-input/PT100 pin) measures
+is entirely site configuration, not something the decoder can know.
+`decodeUC100`/`decodeUC300`/`decodeUC501` extract `(ModbusChannel, value)` or
+`(IOChannel, value)` pairs only; `sensor_type` and `sensor_id` are filled in
+afterward by `resolveChannelRecord` (main.go) from
+[`device_channels.json`](#device-channel-registry-device_channelsjson)
 + [`sensors.json`](#sensor-registry-sensorsjson) — see the [decode chain](#decode-chain-end-to-end)
 above. A channel with no `device_channels.json` entry is dropped (logged),
-never written under an empty or made-up `sensor_type`. This is why UC300's
-GPIO/PT100/ADC hardware needed no new `sensor_type` names discussed up
+never written under an empty or made-up `sensor_type`. This is why none of
+these three devices' fixed I/O needed a new `sensor_type` name discussed up
 front, despite this repo's [naming convention](#naming-convention-for-sensor_type)
 requiring exactly that for every other device: the physical meaning of a
 channel is attributed entirely through `device_channels.json` + `sensors.json`
 at deploy time (reusing an already-registered `sensor_type`, or a newly
-discussed one), the same as a Modbus channel — never invented in Go.
+discussed one), the same as a Modbus channel — never invented in Go. `uc501`
+does have one fixed reading, `battery_level` — its own battery isn't
+site-configurable the way an attached RS485/GPIO instrument is.
 
 Wire format reference: `https://github.com/Milesight-IoT/SensorDecoders/tree/main/uc-series`.
-The Modbus channel entry is `[0xFF][0x19][channel_id][data_length (unused
-on the wire — length is derived from data_type instead)][data_type: bit7=sign,
-bits0-6=type][value: 1/2/4 bytes depending on type]`; `[0xFF][0x15][channel_id]`
-reports a read error for that channel (logged, no `sensor_data` point written).
-UC100 and UC300 firmware agree on the byte length per `data_type` code but
-disagree on what two of those codes actually mean — ported byte-for-byte
-per device, see the doc comments in `uc100.go`/`uc300.go`.
+UC100/UC300's Modbus channel entry is `[0xFF][0x19][channel_id][data_length
+(unused on the wire — length is derived from data_type instead)][data_type:
+bit7=sign, bits0-6=type][value: 1/2/4 bytes depending on type]`;
+`[0xFF][0x15][channel_id]` reports a read error for that channel (logged, no
+`sensor_data` point written). UC100 and UC300 firmware agree on the byte
+length per `data_type` code but disagree on what two of those codes actually
+mean — ported byte-for-byte per device, see the doc comments in
+`uc100.go`/`uc300.go`.
+
+**UC501's Modbus wire shape genuinely differs**, not just its value
+semantics: a 2-byte header (`[modbus_chn_id][package_type]`, `data_type` in
+`package_type`'s low 3 bits, no sign bit) instead of UC100/300's 3-byte
+header, marked by channel_id `0xFF` **or** `0x80` (type `0x0E`) instead of
+`0xFF`/`0x19` — and `0x80` carries one extra trailing alarm byte no other
+variant has. `uc.go`'s shared tokenizer (`ParseUCTLV`) takes each model's
+Modbus-marker check and entry-length function as parameters specifically to
+accommodate this, rather than hardcoding UC100/300's shape — see the doc
+comment at the top of `uc.go`.
 
 UC300's fixed-hardware channels (`channel_id` 3-14: GPIO input/output,
 PT100, ADC current/voltage) are decoded the same way, carrying `IOChannel`
@@ -594,6 +657,63 @@ is tokenized (so it doesn't corrupt the parse of whatever follows it) but
 not decoded — a single `sensor_data` point can only carry one value per
 `(sensor_type, timestamp)`, same reasoning as VS373's WiFi scan results.
 UC100 has none of this hardware, so it's unaffected.
+
+**UC501's fixed-hardware channels** (GPIO input/output/counter on
+channel_id `0x03`/`0x04`; analog input on `0x05`/`0x06`, with an alarm-report
+variant on `0x85`/`0x86` remapped to the same `IOChannel` as its normal
+counterpart) are decoded the same way. Unlike UC300, UC501's analog input's
+`0xE2` variant is a **primary firmware v3 reporting format**, not an optional
+statistics overlay — so it *is* decoded (`f16le` in `uc.go`, Milesight's own
+non-IEEE754 half-float encoding), taking only the current-value field and
+ignoring the packed min/max/avg that ride along with it. UC501's SDI-12
+probe channel (`0x08`/`0xDB`) is tokenized but not decoded — its payload is
+an ASCII string, which doesn't fit this codebase's float/int/bool model.
+
+### `uc511` / `uc512` — irrigation valve + pipe-pressure controller (Milesight UC511/UC512)
+
+Fixed-purpose, unlike UC100/300/501 — **no RS485 port at all** (confirmed:
+no Modbus marker anywhere in the official decoder), so `uc511.go` uses the
+standard static-length `ParseMilesightTLV`, not `uc.go`. Every reading below
+is device-intrinsic; nothing is site-configurable.
+
+| sensor_type                    | device_index | unit | value type | description                          |
+| ---------------------------------- | -------------- | ------ | ------------ | ---------------------------------------- |
+| `battery_level`                 | —            | %    | float      | Battery charge percentage                |
+| `solenoid_valve_status`         | 1/2          | —    | bool       | Open/closed, reported directly by the device — no raw counterpart exists |
+| `pulse_count`                   | 1/2          | —    | int        | Per-valve actuation/flow pulse counter   |
+| `digital_input`                 | 1/2          | —    | bool       | Auxiliary GPIO pin state (hw≥v2.0, fw≥v2.4) |
+| `water_pressure`                | —            | —    | int        | Pipe pressure (unit per Milesight's own product doc — not stated in the decoder itself) |
+| `pressure_sensor_fail_status`   | —            | —    | bool       | `true` = pressure sensor reporting an error |
+
+A valve's raw wire byte `0xFF` means something entirely different from a
+status reading — it's an echo of a downlink delay-control command's result
+(success/failed), not a status — so `decodeUC511` skips it rather than
+writing a fabricated `solenoid_valve_status`. Downlink command-response
+echoes generally (LoRaWAN class-switch, schedule/multicast/AI-collection
+config), `custom_message` (variable-length ASCII, no safe fixed length to
+register), and history channels (`0x20/0xCE` — see the cross-device
+collision note in `channelTypeOverride`; UC511 is a 5th device sharing that
+same known gap) are not decoded into `sensor_data`.
+
+### `vs370` — single-zone occupancy/illuminance presence sensor (Milesight VS370)
+
+Despite the similar name, **not** a smaller VS373: VS373 is a multi-region
+bed/room presence + vital-signs sensor with per-region booleans; VS370 has
+exactly one occupancy reading and one illuminance reading, both simple
+enums, no regions, no per-region indexing. Standard static-length
+`ParseMilesightTLV`, no RS485.
+
+| sensor_type          | unit | value type | description                                       |
+| ----------------------- | ------ | ------------ | ------------------------------------------------------ |
+| `battery_level`      | %    | float      | Battery charge percentage                          |
+| `occupancy_status`   | —    | bool       | `true` = occupied, `false` = vacant                |
+| `illuminance_status` | —    | int (enum) | `0` dim · `1` bright · `254` disable                |
+
+`illuminance_status` is deliberately **not** the same `sensor_type` as
+`nit21li_emw104`'s `illuminance` — that field is a continuous lux float;
+this one is a discrete 3-value enum. Different value shape, can't share a
+name (same `_raw`-suffix-style reasoning as above, just without the suffix
+since neither variant is "raw").
 
 ---
 
@@ -646,7 +766,6 @@ Asset assignment (`asset_id`, geolocation) is **not** part of this file — see
 | `battery_voltage_max` | float                 | optional                  | V, defaults to 4.2 (LiPo/Li-Ion)                      |
 | `battery_voltage_min` | float                 | optional                  | V, defaults to 3.3 (LoRa safe minimum)                |
 | `probe_range_m`       | float                 | optional                  | DTL series: full-scale probe range in metres          |
-| `calibrations`        | array                 | optional                  | per-sensor scale/offset/power corrections             |
 | `allow`               | bool                  | optional                  | set `false` to disable without removing the entry     |
 
 ### Full example with all options
@@ -662,15 +781,7 @@ Asset assignment (`asset_id`, geolocation) is **not** part of this file — see
       "serial_number": "SN-EM500-001",
       "dev_eui": "24e124126d284622",
       "battery_voltage_max": 4.2,
-      "battery_voltage_min": 3.3,
-      "calibrations": [
-        {
-          "sensor_type": "water_level",
-          "scale": 0.01,
-          "offset": 0.0,
-          "power": 1.0
-        }
-      ]
+      "battery_voltage_min": 3.3
     },
     {
       "device_id": "019b08df-26e7-7506-a5f6-916b2bef24f4",
@@ -699,10 +810,6 @@ Asset assignment (`asset_id`, geolocation) is **not** part of this file — see
 - `mac_address` must be a valid MAC address for `ip` devices
 - Duplicate `device_id` or `dev_eui` causes the whole file to be rejected
 - Missing `serial_number` field (key absent, not empty) is a hard error; empty value is a warning
-
-**Calibration formula:** `calibrated = (raw ^ power) × scale + offset`
-
-Identity calibration (`scale=1, offset=0, power=1`) can be omitted entirely.
 
 ---
 
@@ -768,12 +875,24 @@ from `devices.json` on purpose. `sensor_id` is the **stable identity of a
 measurement stream** — assigned once (UUIDv7, not derived/hashed) and never
 recomputed; it persists across a device swap (repoint the `device_id` FK,
 `sensor_id` itself doesn't change). `sensor_type` lives **only here** — not
-duplicated into `device_channels.json`.
+duplicated into `device_channels.json`. This is a flat **pool** of sensors,
+not a hierarchy — `device_id` is a foreign key marking which hardware
+currently carries a sensor, not a container; a device is only "a hardware
+platform to deploy sensors on the field."
 
-Not unique on `(device_id, sensor_type)`: two identical instruments on the
-same RS485 bus can legitimately share a `sensor_type` with different
-`sensor_id`s — see [Device channel registry](#device-channel-registry-device_channelsjson)
-for how those get disambiguated.
+Not unique on `(device_id, sensor_type)` alone — two sensors can legitimately
+share both, disambiguated by `device_index`:
+
+- **Same physical instance, multiple positions** (e.g. `lnv3_sm3dl`'s three
+  `soil_moisture_raw` probes) — the *decoder itself* knows both the
+  sensor_type and the position; `device_index` just picks the right
+  `sensor_id`. This is the common case for non-UC devices.
+- **Different physical instruments on one RS485 bus** (e.g. two identical
+  Modbus sensors on one UC300) — the decoder knows *neither*; resolved
+  instead by wire channel number via
+  [Device channel registry](#device-channel-registry-device_channelsjson),
+  which doesn't use `device_index` at all (the channel number already
+  disambiguates).
 
 Loaded at startup and reloaded on the same `DEVICE_REGISTRY_REFRESH_SEC`
 interval as `devices.json`. Like `assets.json`, a bad or missing
@@ -788,6 +907,8 @@ sensor index rather than crashing.
 | `sensor_id`   | UUIDv7 | **mandatory**  | unique sensor identifier — stable identity of a measurement stream |
 | `sensor_type` | string | **mandatory**  | must match a `record.SensorTypes` field (validated via `record.AllSensorTypes()`) |
 | `device_id`   | UUIDv7 | **mandatory**  | FK → `devices.json`; soft/lenient — no error if the device isn't found |
+| `device_index`| int    | optional       | disambiguates multiple sensors sharing `(device_id, sensor_type)`; omit for single-instance sensors — matches `record.SensorDataRecord.DeviceIndex`; never written to InfluxDB3 |
+| `sensor_name` | string | optional       | purely cosmetic human label (e.g. `"Depth 10cm"`); never used for resolution, never written to InfluxDB3 |
 
 ### Full example
 
@@ -796,7 +917,8 @@ sensor index rather than crashing.
   "version": "1",
   "sensors": [
     { "sensor_id": "01a03953-9387-76dd-bc9f-ee2b674fed66", "sensor_type": "water_level", "device_id": "01a03953-9387-7631-b960-5d7f9305a67c" },
-    { "sensor_id": "01a03953-9387-76e9-b9dd-ce9662f2e172", "sensor_type": "battery_level", "device_id": "01a03953-9387-7631-b960-5d7f9305a67c" }
+    { "sensor_id": "01a03953-9387-76e9-b9dd-ce9662f2e172", "sensor_type": "battery_level", "device_id": "01a03953-9387-7631-b960-5d7f9305a67c" },
+    { "sensor_id": "01a03992-e6c6-75d1-9ba4-0999e88e0c37", "sensor_type": "soil_moisture_raw", "device_id": "019f708d-1d7f-7d24-9029-e84713cddb96", "device_index": 1, "sensor_name": "Depth 10cm" }
   ]
 }
 ```
@@ -805,30 +927,37 @@ sensor index rather than crashing.
 
 - `sensor_id` and `device_id` must be valid UUIDv7
 - `sensor_type` must be a recognized `record.ST` value — add it to `record.go` first (after discussion; see [naming convention](#naming-convention-for-sensor_type)) if it's genuinely new
+- `device_index` must not be negative
 - Duplicate `sensor_id` causes the whole file to be rejected
+- Duplicate `(device_id, sensor_type, device_index)` tuple causes the whole file to be rejected — a genuine config error, not legitimate multi-instance disambiguation
 - A `device_id` with no matching `devices.json` entry is not an error — soft FK, same philosophy as `assets.json`
 
-`buildSensorIndex` (main.go) derives a `(device_id, sensor_type) -> sensor_id`
-lookup from this file for every non-UC decoder. When two sensors share the
-same `(device_id, sensor_type)` pair, **both are excluded** from that index
-(logged as ambiguous) — such pairs can only be resolved by channel number,
-via `device_channels.json`.
+`buildSensorIndex` (main.go) derives a `(device_id, sensor_type, device_index)
+-> sensor_id` lookup from this file for every non-UC decoder (`device_index`
+defaults to `0` for single-instance sensors, matching the zero value decoders
+leave on `SensorDataRecord.DeviceIndex` when they never set it — so this is
+fully backward compatible with sensors that predate `device_index`). If a
+tuple is *still* ambiguous even including `device_index` (shouldn't happen —
+`GetSensorsMap` rejects duplicate tuples at load time — but this index
+doesn't re-trust that), it's excluded (logged, not an error) rather than
+resolved arbitrarily.
 
 ---
 
 ## Device channel registry (`device_channels.json`)
 
-**UC100/UC300 only.** Routes a physical Modbus channel, or (UC300 only) a
-fixed-hardware GPIO/PT100/ADC channel, to a `sensor_id`. Deliberately
-carries **no** `sensor_type` — that lives only in `sensors.json`, looked up
-via the `sensor_id` here. This is what lets the resolution step tell two
-same-`sensor_type` instruments on one bus apart, since `sensors.json` alone
-can't (see above).
+**UC100/UC300/UC501 only.** Routes a physical Modbus channel, or (UC300/UC501
+only) a fixed-hardware GPIO/PT100/ADC/analog-input channel, to a `sensor_id`.
+Deliberately carries **no** `sensor_type` — that lives only in
+`sensors.json`, looked up via the `sensor_id` here. This is what lets the
+resolution step tell two same-`sensor_type` instruments on one bus apart,
+since `sensors.json` alone can't (see above).
 
-A UC100/UC300 decoder cannot know what any channel *means* — that's
-entirely site config. Records from `decodeUC100`/`decodeUC300` carry
-`ModbusChannel` or `IOChannel` instead of `SensorType`; `resolveChannelRecord`
-(main.go) looks up `deviceChannels[deviceID].Modbus[channel]` or `.IO[channel]`
+None of these three decoders can know what any channel *means* — that's
+entirely site config. Records from `decodeUC100`/`decodeUC300`/`decodeUC501`
+carry `ModbusChannel` or `IOChannel` instead of `SensorType`;
+`resolveChannelRecord` (main.go) looks up
+`deviceChannels[deviceID].Modbus[channel]` or `.IO[channel]`
 → `sensor_id` → `sensors.json`'s `sensor_type`, filling both `SensorType` and
 `SensorID` before write. **A channel with no entry here is dropped** (logged),
 never written under an empty or made-up `sensor_type`.
@@ -841,11 +970,11 @@ interval. Non-fatal on a bad/missing file, same as `sensors.json`/`assets.json`.
 | field             | type   | required                          | notes                                                  |
 | ------------------- | -------- | ------------------------------------ | ----------------------------------------------------------- |
 | `version`         | string | —                                  | top-level; log-only; bump when schema changes         |
-| `device_id`       | UUIDv7 | **mandatory**                      | FK → `devices.json`, must be `uc100` or `uc300`        |
+| `device_id`       | UUIDv7 | **mandatory**                      | FK → `devices.json`, must be `uc100`, `uc300`, or `uc501` |
 | `sensor_id`       | UUIDv7 | **mandatory**                      | FK → `sensors.json`                                    |
 | `modbus_channel`  | int    | required for a Modbus entry (1-32) | must be set together with `modbus_slave_id`            |
 | `modbus_slave_id` | int    | required for a Modbus entry        | documentation only — not read at decode time           |
-| `io_channel`      | int    | required for an IO entry (3-14)    | UC300 only — UC100 has no fixed I/O hardware. Covers GPIO input/output, PT100, and ADC current/voltage alike (they share one `channel_id` namespace on the wire — see the `uc300` section above) |
+| `io_channel`      | int    | required for an IO entry           | UC300/UC501 only — UC100 has no fixed I/O hardware. On UC300, covers GPIO input/output, PT100, and ADC current/voltage alike (channel_id 3-14, one namespace on the wire); on UC501, covers GPIO (channel_id 3-4) and analog input (channel_id 5-6, alarm-report variant on 0x85/0x86 remapped to the same channel) — see the `uc100`/`uc300`/`uc501` sensor type reference section above for each device's exact channel meanings |
 
 Each entry is **either** a Modbus channel (`modbus_channel` + `modbus_slave_id`)
 **or** an IO channel (`io_channel`) — never both, never neither.
@@ -881,5 +1010,5 @@ Each entry is **either** a Modbus channel (`modbus_channel` + `modbus_slave_id`)
 | `DEVICE_REGISTRY_FILE`        | `devices.json`                 | Path to the JSON device registry                   |
 | `ASSET_REGISTRY_FILE`         | `assets.json`                  | Path to the JSON asset registry                    |
 | `SENSOR_REGISTRY_FILE`        | `sensors.json`                 | Path to the JSON sensor registry                    |
-| `DEVICE_CHANNEL_REGISTRY_FILE`| `device_channels.json`         | Path to the JSON UC100/UC300 channel registry        |
+| `DEVICE_CHANNEL_REGISTRY_FILE`| `device_channels.json`         | Path to the JSON UC100/UC300/UC501 channel registry  |
 | `DEVICE_REGISTRY_REFRESH_SEC` | `30`                            | Poll interval (seconds) for hot-reload of all four registries |

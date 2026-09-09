@@ -27,11 +27,26 @@ type SensorDataRecord struct {
 	// GPIO/PT100/ADC channels (raw channel_id byte, 3-14): what any of those
 	// pins is wired to is site config too, not something the decoder can name.
 	// Resolved the same way, via device_channels.json's io_channel field.
-	IOChannel  int
-	DevEUI     string // LoRaWAN devices only
-	MacAddress string // IP/WiFi devices only
-	Provider   string
-	Timestamp  time.Time
+	IOChannel int
+	// DeviceIndex disambiguates multiple sensors of the same SensorType on one
+	// device (e.g. three soil-moisture probes, two solenoid valves) — set
+	// directly by decoders that inherently know it (unlike ModbusChannel/
+	// IOChannel, no site config is needed: the decoder already knows both the
+	// physical quantity and which position it came from). Resolved against
+	// sensors.json's own device_index field to pick the right sensor_id. Never
+	// written to InfluxDB3 — once sensor_id is resolved, this has done its job.
+	// Zero for every single-instance SensorType.
+	DeviceIndex int
+	DevEUI      string // LoRaWAN devices only
+	MacAddress  string // IP/WiFi devices only
+	// AssetID is resolved from assets.json via the device's asset assignment
+	// (main.go's mergeAssetInfo) — never set by decoders. Empty when the
+	// device isn't assigned to any asset yet; asset_coords is deliberately
+	// never written here (or to InfluxDB3) — it's static per-asset metadata,
+	// resolved by lookup rather than duplicated on every point.
+	AssetID   string
+	Provider  string
+	Timestamp time.Time
 }
 
 func NewFloat(sensorType, deviceModel, deviceID, provider string, value float64, ts time.Time) SensorDataRecord {
@@ -64,18 +79,34 @@ func NewBool(sensorType, deviceModel, deviceID, provider string, value bool, ts 
 
 // SensorTypes defines every canonical sensor_type tag value written to sensor_data.
 // Use the ST singleton — never hardcode the string literals in parsers.
+//
+// Naming rule for a "_raw" suffix: use it when the value needs client-side
+// calibration/unit-conversion to become physically meaningful (e.g. an
+// uncalibrated ADC count) — that conversion is applied by whatever consumes
+// the SmartCampusMaua API, never by this pipeline. Omit it when the device
+// itself already computed the final value (e.g. EM500-SMTC's soil_moisture
+// is scaled on-device). A "_raw" and its non-"_raw" counterpart (e.g.
+// SolenoidValveRaw / SolenoidValveStatus) are two different measurements,
+// not two names for the same one — never merge them under a single
+// sensor_type.
 type SensorTypes struct {
-	// ── IMT LoraNodeV3 / Soil Moisture 3 Depth Levels (LNV3-SM3DL) ─────────
-	SMDL1        string //SoilMoisture @ 10 cm of Depth Level
-	SMDL2        string // SoilMoisture @ 30 cm of Depth Level
-	SMDL3        string // SoilMoisture @ 70 cm of Depth Level
-	BoardVoltage string // board_voltage
+	// ── Soil moisture, raw transducer reading (IMT LNV3-SM3DL; also usable ──
+	// ── by a Modbus-configured RS485 soil probe on UC-series) ─────────────
+	// Needs client-side calibration to become a meaningful percentage — see
+	// the _raw naming convention below. DeviceIndex disambiguates multiple
+	// probes on one device (e.g. depth 1/2/3).
+	SoilMoistureRaw string // soil_moisture_raw
+	BoardVoltage    string // board_voltage
 
-	// ── IMT LoraNodeV3 / Solenoid Valve Control (LNV3-SVC) ───────────────
-	SV1 string // Solenoid Valve 1
-	SV2 string // Solenoid Valve 2
-	SV3 string // Solenoid Valve 3
-	// PulseCount string // pulse_count
+	// ── Solenoid valve (IMT LNV3-SVC raw transducer; UC511 direct status) ──
+	// SolenoidValveRaw is an uncalibrated ADC reading (LNV3-SVC only) —
+	// turning it into an open/closed reading is a client-side concern, not
+	// something this pipeline computes. SolenoidValveStatus is reported
+	// directly by UC511 instead: its firmware does the ADC-to-status
+	// decision on-device, so UC511 has no raw counterpart to report.
+	// DeviceIndex disambiguates multiple valves on one device.
+	SolenoidValveRaw    string // solenoid_valve_raw
+	SolenoidValveStatus string // solenoid_valve_status
 
 	// ── Weather / environmental (Khomp NIT21LI-EMW104) ───────────────────
 	InternalTemp string // internal_temp
@@ -159,7 +190,7 @@ type SensorTypes struct {
 	SoilTemp               string // soil_temp  °C (EM500-SMTC)
 	SoilMoisture           string // soil_moisture  % (EM500-SMTC)
 	TemperatureMutation    string // temperature_mutation  °C delta (EM500-SMTC alarm channel)
-	TemperatureAlarm       string // temperature_alarm  raw enum (device-specific — see device_model): EM500-SMTC 0=release 1=threshold 2=mutation; AT101 0=normal 1=abnormal
+	SoilTempAlarm          string // soil_temp_alarm  raw enum: 0=release 1=threshold 2=mutation (EM500-SMTC)
 
 	// ── Smart button (WS101) ──────────────────────────────────────────────
 	PressType  string // press_type  1=single 2=long 3=double
@@ -170,8 +201,7 @@ type SensorTypes struct {
 	// ── DTL200-SWL standardised analog/digital I/O names ────────────────
 	CurrentLoop     string // current_loop      mA   4-20 mA current-loop input
 	VoltageInput    string // voltage_input      V   0-30 V analog voltage input
-	DigitalInput1   string // digital_input1         IN1 pin state (bool)
-	DigitalInput2   string // digital_input2         IN2 pin state (bool)
+	DigitalInput    string // digital_input          pin state (bool); DeviceIndex disambiguates multiple pins on one device
 	InterruptLevel  string // interrupt_level        Exti pin level (bool)
 	InterruptStatus string // interrupt_status       Exti trigger active (bool)
 
@@ -204,18 +234,28 @@ type SensorTypes struct {
 	AlarmRegionID string // alarm_region_id   present only for out_of_bed/bradynea/tachypnea alarm types
 
 	// ── Asset tracker (AT101) ──────────────────────────────────────────────
-	Temperature    string // temperature      °C
+	// Temperature reads as AirTemp (shared with NIT21LI-EMW104/EM300-DI) —
+	// AT101 has no raw counterpart of its own, just this one ambient reading.
+	AirTempAlarm   string // air_temp_alarm   raw enum: 0=normal 1=abnormal (AT101)
 	Latitude       string // latitude         °
 	Longitude      string // longitude        °
 	MotionStatus   string // motion_status    raw enum: 0=unknown 1=start 2=moving 3=stop
 	GeofenceStatus string // geofence_status  raw enum: 0=inside 1=outside 2=unset 3=unknown
 	DevicePosition string // device_position  raw enum: 0=normal 1=tilt
 	TamperStatus   string // tamper_status    raw enum: 0=install 1=uninstall
+
+	// ── Irrigation valve + pressure controller (UC511/UC512) ──────────────
+	WaterPressure            string // water_pressure              unindexed — one pressure sensor per device
+	PressureSensorFailStatus string // pressure_sensor_fail_status unindexed; bool
+
+	// ── Occupancy / illuminance presence sensor (VS370) ────────────────────
+	OccupancyStatus   string // occupancy_status    bool: false=vacant true=occupied
+	IlluminanceStatus string // illuminance_status  raw enum: 0=dim 1=bright 254=disable
 }
 
 var ST = SensorTypes{
-	SMDL1: "smdl1", SMDL2: "smdl2", SMDL3: "smdl3", BoardVoltage: "board_voltage",
-	SV1: "sv1", SV2: "sv2", SV3: "sv3",
+	SoilMoistureRaw: "soil_moisture_raw", BoardVoltage: "board_voltage",
+	SolenoidValveRaw: "solenoid_valve_raw", SolenoidValveStatus: "solenoid_valve_status",
 
 	InternalTemp: "internal_temp", InternalRH: "internal_rh",
 	AirTemp: "air_temp", AirRH: "air_rh",
@@ -248,13 +288,13 @@ var ST = SensorTypes{
 	// water / soil
 	WaterLevel: "water_level", ElectricalConductivity: "electrical_conductivity",
 	SoilTemp: "soil_temp", SoilMoisture: "soil_moisture",
-	TemperatureMutation: "temperature_mutation", TemperatureAlarm: "temperature_alarm",
+	TemperatureMutation: "temperature_mutation", SoilTempAlarm: "soil_temp_alarm",
 	// button
 	PressType: "press_type", PressState: "press_state", PressCount: "press_count",
 	// DTL200 I/O
 	// DTL200 I/O
 	CurrentLoop: "current_loop", VoltageInput: "voltage_input",
-	DigitalInput1: "digital_input1", DigitalInput2: "digital_input2",
+	DigitalInput:   "digital_input",
 	InterruptLevel: "interrupt_level", InterruptStatus: "interrupt_status",
 	// VS373 bed / room presence & vital signs
 	DetectionStatus: "detection_status", TargetStatus: "target_status",
@@ -269,9 +309,13 @@ var ST = SensorTypes{
 	AlarmID: "alarm_id", AlarmType: "alarm_type",
 	AlarmStatus: "alarm_status", AlarmRegionID: "alarm_region_id",
 	// AT101 asset tracker
-	Temperature: "temperature", Latitude: "latitude", Longitude: "longitude",
+	AirTempAlarm: "air_temp_alarm", Latitude: "latitude", Longitude: "longitude",
 	MotionStatus: "motion_status", GeofenceStatus: "geofence_status",
 	DevicePosition: "device_position", TamperStatus: "tamper_status",
+	// UC511/UC512 irrigation valve + pressure controller
+	WaterPressure: "water_pressure", PressureSensorFailStatus: "pressure_sensor_fail_status",
+	// VS370 occupancy/illuminance presence sensor
+	OccupancyStatus: "occupancy_status", IlluminanceStatus: "illuminance_status",
 }
 
 // AllSensorTypes returns every canonical sensor_type value defined on ST, for

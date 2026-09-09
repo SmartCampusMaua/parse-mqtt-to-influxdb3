@@ -63,7 +63,7 @@ func TestDecodeEM500SMTC_TempMutationAlarm(t *testing.T) {
 	if mut := got[st.TemperatureMutation]; mut.ValueFloat == nil || *mut.ValueFloat != 5.0 {
 		t.Errorf("TemperatureMutation: got %+v, want 5.0", mut)
 	}
-	if alarm := got[st.TemperatureAlarm]; alarm.ValueInt == nil || *alarm.ValueInt != 2 {
-		t.Errorf("TemperatureAlarm: got %+v, want 2", alarm)
+	if alarm := got[st.SoilTempAlarm]; alarm.ValueInt == nil || *alarm.ValueInt != 2 {
+		t.Errorf("SoilTempAlarm: got %+v, want 2", alarm)
 	}
 }

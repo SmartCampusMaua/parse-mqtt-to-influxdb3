@@ -48,7 +48,10 @@ COPY --from=builder /go/bin/parse-mqtt-to-influxdb3 /go/bin/parse-mqtt-to-influx
 
 USER appuser:appuser
 
-# Default path for the device registry file (override via env or volume mount)
+# Default paths for the four registry files (override via env or volume mount)
 ENV DEVICE_REGISTRY_FILE=/etc/mqtt-to-influxdb3/devices.json
+ENV ASSET_REGISTRY_FILE=/etc/mqtt-to-influxdb3/assets.json
+ENV SENSOR_REGISTRY_FILE=/etc/mqtt-to-influxdb3/sensors.json
+ENV DEVICE_CHANNEL_REGISTRY_FILE=/etc/mqtt-to-influxdb3/device_channels.json
 
 ENTRYPOINT ["/go/bin/parse-mqtt-to-influxdb3"]

@@ -58,7 +58,7 @@ func decodeEM500SMTC(entries []TLV, deviceID, provider string, ts time.Time) []r
 		case e.Channel == 0x83 && e.Type == 0xD7:
 			out = append(out, record.NewFloat(st.SoilTemp, dm, deviceID, provider, float64(int16(le16(e.Data[0:2])))/10.0, ts))
 			out = append(out, record.NewFloat(st.TemperatureMutation, dm, deviceID, provider, float64(int16(le16(e.Data[2:4])))/10.0, ts))
-			out = append(out, record.NewInt(st.TemperatureAlarm, dm, deviceID, provider, int64(e.Data[4]), ts))
+			out = append(out, record.NewInt(st.SoilTempAlarm, dm, deviceID, provider, int64(e.Data[4]), ts))
 		}
 	}
 	return out

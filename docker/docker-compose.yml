@@ -1,69 +1,26 @@
+name: parse-mqtt-to-influxdb3
+
 services:
-  mosquitto:
-    container_name: mosquitto
-    image: eclipse-mosquitto:2.0.22-openssl
-    restart: unless-stopped
-    ports:
-      - "1883:1883"
-    volumes:
-      - ./mosquitto/etc:/mosquitto/config
-      - ./mosquitto/var/data:/mosquitto/data
-      - ./mosquitto/var/log:/mosquitto/log
-
-  influxdb3-core:
-    image: influxdb:3.9-core
-    restart: unless-stopped
-    ports:
-      - "8181:8181"
-    command:
-      - influxdb3
-      - serve
-      - --node-id=node0
-      - --object-store=file
-      - --data-dir=/var/lib/influxdb3/data
-      - --plugin-dir=/var/lib/influxdb3/plugins
-    volumes:
-      - type: bind
-        source: ~/.influxdb3/data
-        target: /var/lib/influxdb3/data
-      - type: bind
-        source: ~/.influxdb3/plugins
-        target: /var/lib/influxdb3/plugins
-
-  explorer:
-    image: influxdata/influxdb3-ui:1.8.0
-    container_name: influxdb3-explorer
-    restart: unless-stopped
-    ports:
-      - "8888:8080"
-    volumes:
-      - ./config:/app-root/config:ro
-
   mqtt-to-influxdb3:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     restart: unless-stopped
     env_file: ../.env
-    depends_on:
-      - mosquitto
-      - influxdb3-core
+    environment:
+      # Overrides .env's localhost:8181 (only valid for `go run` on the host) —
+      # inside this container, the shared zc2x influxdb3-core is reached by
+      # its container name on the docker_default network.
+      INFLUXDB_HOST: http://influxdb3-core:8181
+    networks:
+      - zc2x
     volumes:
       - ../devices.json:/etc/mqtt-to-influxdb3/devices.json:ro
+      - ../assets.json:/etc/mqtt-to-influxdb3/assets.json:ro
+      - ../sensors.json:/etc/mqtt-to-influxdb3/sensors.json:ro
+      - ../device_channels.json:/etc/mqtt-to-influxdb3/device_channels.json:ro
 
-  grafana:
-    image: grafana/grafana:12.4
-    container_name: grafana
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    volumes:
-      - grafana_data:/var/lib/grafana
-    depends_on:
-      - influxdb3-core
-
-volumes:
-  grafana_data:
+networks:
+  zc2x:
+    name: docker_default
+    external: true

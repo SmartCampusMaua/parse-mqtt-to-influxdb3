@@ -73,10 +73,9 @@ Measurement `raw` in `audit_iot`:
 - Tags: `device_id`, `event_type`
 - Field: `raw_data` (string ≤512 chars)
 
-Measurement `sensor_calibration` in `iot_sensors`:
-
-- Tags: `device_id`, `sensor_type`
-- Fields: `scale`, `offset`, `power` (formula: `calibrated = (raw ^ power) × scale + offset`)
+`sensor_data` and `raw` always hold exactly the value transmitted by the sensor,
+untouched — no calibration/unit-conversion happens in this pipeline. That's a
+client-side/user-space concern for whatever consumes the SmartCampusMaua API.
 
 Four databases on same host/token: `iot_sensors`, `audit_iot`, `vehicle_telemetry`, `audit_vehicle`.
 

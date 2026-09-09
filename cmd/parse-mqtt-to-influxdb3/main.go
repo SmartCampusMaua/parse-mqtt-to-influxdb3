@@ -42,7 +42,7 @@ import (
 // All clients connect to the same InfluxDB3 host with the same token,
 // but write to different hardcoded databases.
 type DBClients struct {
-	IoTSensors       *influxdb3.Client // iot_sensors — sensor_data + sensor_calibration
+	IoTSensors       *influxdb3.Client // iot_sensors — sensor_data
 	AuditIoT         *influxdb3.Client // audit_iot — raw MQTT payload ingest
 	VehicleTelemetry *influxdb3.Client // vehicle_telemetry — vehicle GPS/CAN data
 	AuditVehicle     *influxdb3.Client // audit_vehicle — raw vehicle audit logs
@@ -59,18 +59,12 @@ func (c *DBClients) Close() {
 //
 // Single source of truth for:
 //   – hardware model constants (DeviceModel)
-//   – per-sensor calibration parameters: scale, offset, power
-//     formula (applied by users when plotting):
-//       calibrated = (raw ^ power) × scale + offset
-//     defaults (scale=1, offset=0, power=1) leave raw values unchanged.
 //   – battery voltage range for battery_level % calculation
 //
-// ┌── How to add a new device ────────────────────────────────────────────────┐
-// │  1. Add an ID entry: "device_eui": d(MODEL)                              │
-// │  2. To calibrate a sensor: d(MODEL, cal("sensor_type", scale, off, pow)) │
-// │  Example – water meter (EM300-DI): 1 pulse = 1 litre = 0.001 m³         │
-// │    "24e124136f315508": d(EM300, cal("pulse_counter", 0.001, 0, 1))      │
-// └───────────────────────────────────────────────────────────────────────────┘
+// sensor_data (and audit_iot's raw) always holds exactly the value
+// transmitted by the sensor, untouched — no calibration/unit-conversion math
+// happens in this pipeline. That's a client-side/user-space concern for
+// whatever consumes the SmartCampusMaua API.
 
 // ─── Device model constants ───────────────────────────────────────────────────
 
@@ -88,21 +82,12 @@ const (
 	WS101   DeviceModel = "WS101"   // Milesight smart button model
 	UC100   DeviceModel = "UC100"   // Milesight UC100 RS485/Modbus controller (Modbus-only, no GPIO)
 	UC300   DeviceModel = "UC300"   // Milesight UC300 RS485/Modbus controller (Modbus + fixed GPIO/PT100/ADC)
+	UC501   DeviceModel = "UC501"   // Milesight UC501/UC50x RS485/Modbus controller (Modbus + site-wired GPIO/analog input)
+	UC511   DeviceModel = "UC511"   // Milesight UC511/UC512 irrigation valve + pipe-pressure controller (fixed-purpose, no RS485)
+	VS370   DeviceModel = "VS370"   // Milesight VS370 single-zone occupancy/illuminance presence sensor
 )
 
-// ─── Calibration types ────────────────────────────────────────────────────────
-
-// DeviceCalibration holds the sensor_calibration parameters for one sensor.
-// Entries are written to the sensor_calibration measurement at startup.
-// Scale, Offset, Power default to 1, 0, 1 (identity: output = input).
-type DeviceCalibration struct {
-	SensorType string  `json:"sensor_type"`
-	Scale      float64 `json:"scale"`  // multiply factor  — default 1.0
-	Offset     float64 `json:"offset"` // additive offset   — default 0.0
-	Power      float64 `json:"power"`  // exponent          — default 1.0
-}
-
-// DeviceConfig bundles model, battery range, and optional calibrations.
+// DeviceConfig bundles model and battery range.
 type DeviceConfig struct {
 	Model             DeviceModel
 	DeviceType        string // "LORAWAN" or "IP"
@@ -113,7 +98,6 @@ type DeviceConfig struct {
 	BatteryVoltageMax float64 // V, full charge  (default 4.2 — LiPo/Li-Ion)
 	BatteryVoltageMin float64 // V, cutoff       (default 3.3 — LoRa safe minimum)
 	ProbeRangeM       float64 // DTL200: overrides bytes[3] when 0 (not configured via downlink)
-	Calibrations      []DeviceCalibration
 }
 
 // ─── Device registry ─────────────────────────────────────────────────────────
@@ -123,17 +107,16 @@ type DeviceConfig struct {
 // Asset assignment (asset_id, asset_coords) lives in the separate asset
 // registry (assets.json), not here — see AssetEntry.
 type DeviceEntry struct {
-	Allow             *bool               `json:"allow,omitempty"`
-	DeviceID          string              `json:"device_id,omitempty"`
-	DeviceType        string              `json:"device_type,omitempty"` // "lorawan" or "ip"
-	SerialNumber      *string             `json:"serial_number"`         // required; warn if empty
-	DevEUI            string              `json:"dev_eui,omitempty"`     // mandatory for lorawan
-	MacAddress        string              `json:"mac_address,omitempty"` // mandatory for ip
-	DeviceModel       DeviceModel         `json:"device_model,omitempty"`
-	BatteryVoltageMax float64             `json:"battery_voltage_max,omitempty"`
-	BatteryVoltageMin float64             `json:"battery_voltage_min,omitempty"`
-	ProbeRangeM       float64             `json:"probe_range_m,omitempty"`
-	Calibrations      []DeviceCalibration `json:"calibrations,omitempty"`
+	Allow             *bool       `json:"allow,omitempty"`
+	DeviceID          string      `json:"device_id,omitempty"`
+	DeviceType        string      `json:"device_type,omitempty"` // "lorawan" or "ip"
+	SerialNumber      *string     `json:"serial_number"`         // required; warn if empty
+	DevEUI            string      `json:"dev_eui,omitempty"`     // mandatory for lorawan
+	MacAddress        string      `json:"mac_address,omitempty"` // mandatory for ip
+	DeviceModel       DeviceModel `json:"device_model,omitempty"`
+	BatteryVoltageMax float64     `json:"battery_voltage_max,omitempty"`
+	BatteryVoltageMin float64     `json:"battery_voltage_min,omitempty"`
+	ProbeRangeM       float64     `json:"probe_range_m,omitempty"`
 }
 
 // AssetCoords stores optional asset geolocation metadata.
@@ -281,18 +264,6 @@ func GetDevicesMap(registryPath string) (map[string]DeviceConfig, map[string]str
 			serialNumber = *entry.SerialNumber
 		}
 
-		calibrations := make([]DeviceCalibration, 0, len(entry.Calibrations))
-		for _, c := range entry.Calibrations {
-			if c.SensorType == "" {
-				continue
-			}
-			// Identity calibration does not need to be written/stored.
-			if c.Scale == 1.0 && c.Offset == 0.0 && c.Power == 1.0 {
-				continue
-			}
-			calibrations = append(calibrations, c)
-		}
-
 		deviceMap[deviceID] = DeviceConfig{
 			Model:             deviceModel,
 			DeviceType:        strings.ToUpper(entry.DeviceType),
@@ -301,7 +272,6 @@ func GetDevicesMap(registryPath string) (map[string]DeviceConfig, map[string]str
 			BatteryVoltageMax: batteryMax,
 			BatteryVoltageMin: batteryMin,
 			ProbeRangeM:       entry.ProbeRangeM,
-			Calibrations:      calibrations,
 		}
 
 		if entry.DevEUI != "" {
@@ -415,6 +385,14 @@ type SensorEntry struct {
 	SensorID   string `json:"sensor_id,omitempty"`
 	SensorType string `json:"sensor_type,omitempty"`
 	DeviceID   string `json:"device_id,omitempty"` // FK -> devices.json; who currently reports this sensor
+	// DeviceIndex disambiguates multiple sensors sharing (device_id,
+	// sensor_type) on one device (e.g. three soil-moisture probes at
+	// different depths) — matches record.SensorDataRecord.DeviceIndex. Zero
+	// for single-instance sensors. Never written to InfluxDB3.
+	DeviceIndex int `json:"device_index,omitempty"`
+	// SensorName is a purely cosmetic human label (e.g. "Depth 10cm") — never
+	// used for resolution, never written to InfluxDB3.
+	SensorName string `json:"sensor_name,omitempty"`
 }
 
 type SensorRegistryFile struct {
@@ -425,8 +403,10 @@ type SensorRegistryFile struct {
 // SensorConfig is the resolved projection of one SensorEntry, keyed by
 // sensor_id in the map GetSensorsMap returns.
 type SensorConfig struct {
-	SensorType string
-	DeviceID   string
+	SensorType  string
+	DeviceID    string
+	DeviceIndex int
+	SensorName  string
 }
 
 // validateSensorEntry checks mandatory fields and format constraints for one
@@ -451,6 +431,9 @@ func validateSensorEntry(s SensorEntry, validTypes map[string]bool) error {
 	if !isUUIDv7(s.DeviceID) {
 		return fmt.Errorf("sensor %s: device_id must be a valid UUIDv7", s.SensorID)
 	}
+	if s.DeviceIndex < 0 {
+		return fmt.Errorf("sensor %s: device_index must not be negative", s.SensorID)
+	}
 	return nil
 }
 
@@ -460,9 +443,10 @@ func validateSensorEntry(s SensorEntry, validTypes map[string]bool) error {
 // existing in devices.json) are deliberately NOT checked here — same
 // decoupling as GetAssetsMap: an entry pointing at a device_id that doesn't
 // (yet) exist just never resolves to anything at decode time, rather than
-// failing the whole file. Not unique on (device_id, sensor_type) — two
-// sensors of the same type can legitimately share a device (e.g. two
-// identical instruments on one RS485 bus); only sensor_id itself is unique.
+// failing the whole file. Not unique on (device_id, sensor_type) alone — two
+// sensors of the same type can legitimately share a device (e.g. three
+// soil-moisture probes at different depths); device_index disambiguates
+// them, and (device_id, sensor_type, device_index) together must be unique.
 func GetSensorsMap(registryPath string) (map[string]SensorConfig, error) {
 	contents, err := os.ReadFile(registryPath)
 	if err != nil {
@@ -482,6 +466,7 @@ func GetSensorsMap(registryPath string) (map[string]SensorConfig, error) {
 
 	validTypes := record.AllSensorTypes()
 	sensorMap := make(map[string]SensorConfig, len(reg.Sensors))
+	seenTuple := make(map[string]string, len(reg.Sensors)) // (device_id,sensor_type,device_index) -> sensor_id
 
 	for i, s := range reg.Sensors {
 		if err := validateSensorEntry(s, validTypes); err != nil {
@@ -490,7 +475,15 @@ func GetSensorsMap(registryPath string) (map[string]SensorConfig, error) {
 		if _, exists := sensorMap[s.SensorID]; exists {
 			return nil, fmt.Errorf("duplicate sensor_id in registry: %s", s.SensorID)
 		}
-		sensorMap[s.SensorID] = SensorConfig{SensorType: s.SensorType, DeviceID: s.DeviceID}
+		tupleKey := sensorIndexKey(s.DeviceID, s.SensorType, s.DeviceIndex)
+		if existing, exists := seenTuple[tupleKey]; exists {
+			return nil, fmt.Errorf("entry[%d]: device_id/sensor_type/device_index already assigned to sensor %s: %s", i, existing, tupleKey)
+		}
+		seenTuple[tupleKey] = s.SensorID
+		sensorMap[s.SensorID] = SensorConfig{
+			SensorType: s.SensorType, DeviceID: s.DeviceID, DeviceIndex: s.DeviceIndex,
+			SensorName: s.SensorName,
+		}
 	}
 
 	return sensorMap, nil
@@ -627,35 +620,40 @@ func GetDeviceChannelsMap(registryPath string, deviceMap map[string]DeviceConfig
 	return out, nil
 }
 
-// sensorIndexKey joins deviceID+sensorType into the reverse-index key used by
-// buildSensorIndex/resolveSensorID. Not exported; the separator can't appear
-// in a UUIDv7 or a record.ST value, so a plain join is safe.
-func sensorIndexKey(deviceID, sensorType string) string {
-	return deviceID + "\x00" + sensorType
+// sensorIndexKey joins deviceID+sensorType+deviceIndex into the reverse-index
+// key used by buildSensorIndex/resolveSensorID. Not exported; the separator
+// can't appear in a UUIDv7 or a record.ST value, so a plain join is safe.
+// deviceIndex is 0 for every single-instance sensor_type — same as the zero
+// value of record.SensorDataRecord.DeviceIndex, so callers never need to
+// special-case it.
+func sensorIndexKey(deviceID, sensorType string, deviceIndex int) string {
+	return deviceID + "\x00" + sensorType + "\x00" + strconv.Itoa(deviceIndex)
 }
 
-// buildSensorIndex derives a (device_id, sensor_type) -> sensor_id lookup from
-// sensors.json, used to stamp a stable sensor_id onto every decoded record
-// without decoders needing to know about the sensor registry at all.
+// buildSensorIndex derives a (device_id, sensor_type, device_index) ->
+// sensor_id lookup from sensors.json, used to stamp a stable sensor_id onto
+// every decoded record without decoders needing to know about the sensor
+// registry at all.
 //
-// sensors.json is deliberately NOT unique on (device_id, sensor_type) — e.g.
-// two identical Modbus instruments on the same UC300 bus can share a
-// sensor_type. Such pairs are ambiguous from sensor_type alone, so they are
-// left out of this index (logged, not an error); resolving them requires
-// channel-aware lookup via device_channels.json, done separately inside the
-// UC-series decoders once those exist.
+// sensors.json is deliberately NOT unique on (device_id, sensor_type) alone
+// — e.g. three soil-moisture probes on one device share a sensor_type,
+// disambiguated by device_index (GetSensorsMap enforces uniqueness on the
+// full (device_id, sensor_type, device_index) triple). A tuple that's STILL
+// ambiguous even including device_index (shouldn't happen given that
+// enforcement, but this index doesn't re-trust it) is left out here (logged,
+// not an error) rather than resolved arbitrarily.
 func buildSensorIndex(sensorMap map[string]SensorConfig) map[string]string {
 	counts := make(map[string]int, len(sensorMap))
 	sensorIDByKey := make(map[string]string, len(sensorMap))
 	for sensorID, s := range sensorMap {
-		key := sensorIndexKey(s.DeviceID, s.SensorType)
+		key := sensorIndexKey(s.DeviceID, s.SensorType, s.DeviceIndex)
 		counts[key]++
 		sensorIDByKey[key] = sensorID
 	}
 	index := make(map[string]string, len(sensorIDByKey))
 	for key, sensorID := range sensorIDByKey {
 		if counts[key] > 1 {
-			log.Printf("[registry] warning: device_id/sensor_type pair is ambiguous in sensors.json (%d sensors share it) — skipping from sensor_id index: %s", counts[key], key)
+			log.Printf("[registry] warning: device_id/sensor_type/device_index tuple is ambiguous in sensors.json (%d sensors share it) — skipping from sensor_id index: %s", counts[key], key)
 			continue
 		}
 		index[key] = sensorID
@@ -769,6 +767,9 @@ func writeSensorRecords(ctx context.Context, iot *influxdb3.Client, records []re
 		}
 		if r.SensorID != "" {
 			p = p.SetTag("sensor_id", r.SensorID)
+		}
+		if r.AssetID != "" {
+			p = p.SetTag("asset_id", r.AssetID)
 		}
 		switch r.ValueType {
 		case "float":
@@ -891,22 +892,25 @@ func extractHTTPStatus(errStr string) string {
 	return "4xx"
 }
 
-// writeAuditLog writes the raw MQTT payload to the audit_log measurement.
-// Tag:   device_id  (low cardinality — one per physical device)
-// Field: raw_data   (string — original message, truncated to 512 chars)
-// raw_data is a FIELD (not a tag) to avoid high cardinality in InfluxDB3.
 // writeAuditLog writes every raw MQTT/LoRaWAN payload to the audit_iot database.
 //
 // Schema (measurement = "raw"):
 //
 //	Tags:  device_id                   — identifies the physical device
+//	       asset_id                    — whichever asset the device was assigned to at
+//	                                      this instant (see assets.json); omitted when unassigned
 //	       event_type = "payload_ingest" — fixed; low-cardinality; extensible
 //	Field: raw_data  (string ≤512 chars) — original undecoded message
 //	Time:  ingestion timestamp (time.Now() at message receipt)
 //
+// asset_id here is deliberately just a snapshot of "current" at each instant,
+// same as every other tag on this row — raw is already a continuous,
+// timestamped record of every message, so the full assignment history is
+// already reconstructable from it without any separate change-tracking.
+//
 // The audit database carries a short retention policy set on the InfluxDB3 server
 // (e.g., 7–30 days) independently of the sensor_data database.
-func writeAuditLog(ctx context.Context, audit *influxdb3.Client, deviceID, rawData string, ts time.Time) {
+func writeAuditLog(ctx context.Context, audit *influxdb3.Client, deviceID, assetID, rawData string, ts time.Time) {
 	const maxLen = 512
 	if len(rawData) > maxLen {
 		rawData = rawData[:maxLen] + "…"
@@ -916,103 +920,11 @@ func writeAuditLog(ctx context.Context, audit *influxdb3.Client, deviceID, rawDa
 		SetTag("event_type", "payload_ingest").
 		SetStringField("raw_data", rawData).
 		SetTimestamp(ts)
+	if assetID != "" {
+		p = p.SetTag("asset_id", assetID)
+	}
 	if err := writeWithRetry(ctx, audit, []*influxdb3.Point{p}, 3); err != nil {
 		logWarn("audit write failed for device_id=%s: %v", deviceID, err)
-	}
-}
-
-// writeCalibrations writes sensor_calibration entries for every explicit
-// DeviceCalibration defined in the device registry.
-// Called once at startup; entries act as a reference table for users plotting
-// calibrated values with: calibrated = (raw ^ power) × scale + offset
-// fetchLatestCalibrations reads the most recent sensor_calibration row per
-// (device_id, sensor_type) key, so writeCalibrations can skip re-writing a
-// row whose values already match — otherwise every process restart appends a
-// full duplicate set of rows, which degrades the read-time run-length
-// encoding the timeseries API relies on (api/src/routes/timeseries.ts
-// findApplicableCalibration/calibrationChanged: calibration fields are meant
-// to appear once per stream, not once per restart).
-//
-// Returns an empty map (not an error) when sensor_calibration has no rows
-// yet — e.g. the very first run against a fresh database.
-func fetchLatestCalibrations(ctx context.Context, iot *influxdb3.Client) map[string]DeviceCalibration {
-	existing := make(map[string]DeviceCalibration)
-
-	it, err := iot.QueryPointValue(ctx, `
-		SELECT device_id, sensor_type, "scale", "offset", "power"
-		FROM sensor_calibration
-		ORDER BY time DESC
-	`)
-	if err != nil {
-		log.Printf("[calibration] no existing sensor_calibration rows to diff against (likely first run): %v", err)
-		return existing
-	}
-
-	for {
-		pv, nextErr := it.Next()
-		if nextErr != nil {
-			if nextErr != influxdb3.Done {
-				log.Printf("[calibration] error reading existing sensor_calibration rows: %v", nextErr)
-			}
-			break
-		}
-		deviceID, ok := pv.GetTag("device_id")
-		if !ok {
-			continue
-		}
-		sensorType, ok := pv.GetTag("sensor_type")
-		if !ok {
-			continue
-		}
-		// Rows arrive newest-first; keep only the first (most recent) one seen per key.
-		key := sensorIndexKey(deviceID, sensorType)
-		if _, seen := existing[key]; seen {
-			continue
-		}
-		scale, offset, power := pv.GetDoubleField("scale"), pv.GetDoubleField("offset"), pv.GetDoubleField("power")
-		if scale == nil || offset == nil || power == nil {
-			continue
-		}
-		existing[key] = DeviceCalibration{SensorType: sensorType, Scale: *scale, Offset: *offset, Power: *power}
-	}
-
-	return existing
-}
-
-func writeCalibrations(ctx context.Context, iot *influxdb3.Client, deviceMap map[string]DeviceConfig) {
-	existing := fetchLatestCalibrations(ctx, iot)
-
-	var points []*influxdb3.Point
-	unchanged := 0
-	ts := time.Now()
-	for deviceID, config := range deviceMap {
-		for _, c := range config.Calibrations {
-			if prev, ok := existing[sensorIndexKey(deviceID, c.SensorType)]; ok && prev == c {
-				unchanged++
-				continue
-			}
-			p := influxdb3.NewPointWithMeasurement("sensor_calibration").
-				SetTag("device_id", deviceID).
-				SetTag("sensor_type", c.SensorType).
-				SetDoubleField("scale", c.Scale).
-				SetDoubleField("offset", c.Offset).
-				SetDoubleField("power", c.Power).
-				SetTimestamp(ts)
-			points = append(points, p)
-		}
-	}
-	if len(points) == 0 {
-		if unchanged > 0 {
-			log.Printf("[calibration] all %d calibrations already match the latest sensor_calibration rows — nothing to write", unchanged)
-		} else {
-			log.Printf("[calibration] no custom calibrations defined — all devices use identity transform")
-		}
-		return
-	}
-	if err := iot.WritePoints(ctx, points, influxdb3.WithNoSync(true)); err != nil {
-		logError("calibration write failed: %v", err)
-	} else {
-		log.Printf("[calibration] wrote %d entries to sensor_calibration (%d unchanged, skipped)", len(points), unchanged)
 	}
 }
 
@@ -1106,6 +1018,7 @@ func parseDeviceModel(ctx context.Context, iot *influxdb3.Client,
 		r := records[i]
 		r.DevEUI = devEUI
 		r.MacAddress = config.MacAddress
+		r.AssetID = config.AssetID
 		switch {
 		case r.ModbusChannel != 0:
 			if !resolveChannelRecord(&r, deviceID, r.ModbusChannel, reg.DeviceChannels[deviceID].Modbus, reg, "modbus") {
@@ -1116,7 +1029,7 @@ func parseDeviceModel(ctx context.Context, iot *influxdb3.Client,
 				continue
 			}
 		default:
-			if sensorID, ok := reg.SensorIndex[sensorIndexKey(deviceID, r.SensorType)]; ok {
+			if sensorID, ok := reg.SensorIndex[sensorIndexKey(deviceID, r.SensorType, r.DeviceIndex)]; ok {
 				r.SensorID = sensorID
 			}
 		}
@@ -1331,8 +1244,6 @@ func main() {
 	log.Printf("Sensor registry: file=%s sensors=%d index=%d", SENSOR_REGISTRY_FILE, len(sensorMap), len(sensorIndex))
 	log.Printf("Device channel registry: file=%s devicesWithChannels=%d", DEVICE_CHANNEL_REGISTRY_FILE, len(deviceChannels))
 
-	writeCalibrations(ctx, clients.IoTSensors, deviceMap)
-
 	var registryMu sync.RWMutex
 	refreshTicker := time.NewTicker(time.Duration(DEVICE_REGISTRY_REFRESH_SEC) * time.Second)
 	defer refreshTicker.Stop()
@@ -1353,11 +1264,6 @@ func main() {
 			}
 			mergeAssetInfo(nextDeviceMap, assetByDeviceID)
 
-			// Safe to call on every reload now that writeCalibrations diffs
-			// against the latest existing row per key and only writes what
-			// actually changed (see fetchLatestCalibrations).
-			writeCalibrations(ctx, clients.IoTSensors, nextDeviceMap)
-
 			// Same last-known-good behavior for sensors.json/device_channels.json.
 			// Computed into local vars first so deviceChannels/sensorMap/sensorIndex
 			// (all read by workers) flip together atomically under registryMu.
@@ -1367,6 +1273,7 @@ func main() {
 			} else {
 				nextSensorMap = m
 			}
+
 			nextDeviceChannels := deviceChannels
 			if m, channelReloadErr := GetDeviceChannelsMap(DEVICE_CHANNEL_REGISTRY_FILE, nextDeviceMap); channelReloadErr != nil {
 				log.Printf("[registry] device channel registry reload failed, keeping previous channels: %v", channelReloadErr)
@@ -1484,8 +1391,8 @@ func main() {
 
 				// Audit log and sensor decode+write run concurrently: they target
 				// different InfluxDB3 databases so there is no ordering requirement.
-				auditPayload, auditDeviceID, auditNow := payload, deviceID, time.Now()
-				go writeAuditLog(ctx, clients.AuditIoT, auditDeviceID, auditPayload, auditNow)
+				auditPayload, auditDeviceID, auditAssetID, auditNow := payload, deviceID, config.AssetID, time.Now()
+				go writeAuditLog(ctx, clients.AuditIoT, auditDeviceID, auditAssetID, auditPayload, auditNow)
 
 				parseMsg(ctx, clients.IoTSensors, provider, deviceID, devEUI, config, payload, currentReg)
 			}
