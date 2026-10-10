@@ -3,3 +3,5 @@ devices.json
 assets.json
 sensors.json
 device_channels.json
+infra.json
+infra.docker.json

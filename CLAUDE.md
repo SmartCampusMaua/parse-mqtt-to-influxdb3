@@ -34,6 +34,16 @@ window, inflating the file count time-range queries must scan. Batch write
 failures retry, then fall back to per-point writes; shutdown (signal or MQTT
 connection loss) drains and flushes buffered points before exit.
 
+## Connection config
+
+InfluxDB3 host/token and MQTT broker/credentials load from `infra.json`
+(`cmd/parse-mqtt-to-influxdb3/infra_config.go`), not env vars — mirrors the
+`api` repo's `influxdb.json`/`config.ts` pattern, minus the multi-org list
+(this service only ever has one InfluxDB host+token). Gitignored, holds a
+live token; see `infra.example.json` for the shape. Loaded once at startup,
+fails fast on a bad/missing file — no hot-reload, since the InfluxDB3/MQTT
+clients built from it are never swapped afterward.
+
 ## File layout — one file per device codec
 
 ```

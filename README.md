@@ -1082,13 +1082,48 @@ Response shape from `GET .../modbus-channels`:
 
 ---
 
+## InfluxDB3 + MQTT connection config (`infra.json`)
+
+InfluxDB3 host/token and MQTT broker/credentials are no longer env vars —
+they live in a single JSON file, mirroring the SmartCampusMaua `api` repo's
+`influxdb.json` pattern (see that repo's `src/config.ts`):
+
+```json
+{
+  "version": "1",
+  "influxdb": { "host": "http://influxdb.maua.br:8181", "token": "..." },
+  "mqtt": { "broker": "mqtt.maua.br:1883", "username": "...", "password": "..." }
+}
+```
+
+See `infra.example.json` for a template. Unlike `influxdb.json`'s `orgs`
+array in the `api` repo, this is a flat object — this service only ever
+talks to one InfluxDB host+token pair (shared across its four hardcoded
+databases), so there's no multi-tenant org list to select from.
+
+Loaded once at startup (`cmd/parse-mqtt-to-influxdb3/infra_config.go`),
+failing fast on a missing/invalid file — same "crash at boot rather than run
+with an empty token" philosophy as `api`'s `config.ts`. No background
+reload: the InfluxDB3 clients and MQTT client are constructed once from this
+config and never swapped afterward, so a reload timer would have nothing to
+act on; a config change takes effect on the next restart, same as changing
+an env var always did.
+
+`infra.json` is gitignored (it holds a live token) — same treatment as the
+old `.env`. Docker Compose bind-mounts a separate, also-gitignored
+`infra.docker.json` at `/infra.json` with `influxdb.host` pointed at the
+in-network `influxdb3-core:8181` instead of `localhost:8181` (see
+`docker/docker-compose.yml`); a real Kubernetes deployment should mount the
+equivalent from a `Secret` volume instead (a plain `subPath` mount is fine
+here specifically, unlike the `api` repo's own config files — this service
+never hot-reloads `infra.json`, so a pod restart is already required for
+any change to take effect, the same as a `subPath` mount would require).
+
 ## Environment variables
 
 | variable                      | default                        | description                                        |
 | -------------------------------- | --------------------------------- | ------------------------------------------------------- |
-| `MQTT_BROKER`                 | _(required)_                   | e.g. `tcp://broker:1883`                           |
-| `INFLUXDB_HOST`               | `http://influxdb.maua.br:8181` | InfluxDB3 Core URL                                 |
-| `INFLUXDB_TOKEN`              | _(empty)_                      | Auth token (may be empty for unauthenticated Core) |
+| `INFRA_CONFIG_FILE`           | `infra.json`                   | Path to the InfluxDB3/MQTT connection config file (see above) |
 | `REGISTRY_API_URL`            | `http://localhost:3333`        | Base URL of the SmartCampusMaua `api` repo's registry endpoints (devices/assets/sensors/modbus-channels) — plain unauthenticated `GET`, no token needed. Production points this at that API's in-cluster Kubernetes Service address. |
 | `DEVICE_REGISTRY_REFRESH_SEC` | `30`                            | Poll interval (seconds) for hot-reload of all four registry fetches |
 | `WRITE_WORKERS`               | `2 × GOMAXPROCS`                | Number of goroutines decoding/validating MQTT messages in parallel. Decode workers never call InfluxDB3 directly — see `WRITE_FLUSH_INTERVAL_SEC`/`WRITE_BATCH_SIZE` below. |

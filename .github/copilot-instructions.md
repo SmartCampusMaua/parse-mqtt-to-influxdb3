@@ -39,6 +39,15 @@ unauthenticated GET) at startup and hot-reloaded every
 sensors/Modbus-channels come from that same API's `/assets`, `/sensors`, and
 `/modbus-channels` endpoints.
 
+## Connection config
+
+InfluxDB3 host/token and MQTT broker/credentials load from `infra.json`
+(`cmd/parse-mqtt-to-influxdb3/infra_config.go`), mirroring the SmartCampusMaua
+`api` repo's `influxdb.json`/`config.ts` pattern — a flat object (no
+multi-org list; this service only ever has one InfluxDB host+token), loaded
+once at startup, failing fast on a missing/invalid file. Gitignored, holds a
+live token — see `infra.example.json` for the shape.
+
 ## Decoder file layout
 
 One file per device codec. Naming: `model_submodel.go` (lowercase).

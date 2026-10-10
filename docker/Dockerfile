@@ -49,7 +49,11 @@ COPY --from=builder /go/bin/parse-mqtt-to-influxdb3 /go/bin/parse-mqtt-to-influx
 USER appuser:appuser
 
 # REGISTRY_API_URL (the SmartCampusMaua `api` repo's registry endpoints) is
-# deploy-specific, same as MQTT_BROKER/INFLUXDB_HOST below — set via env_file
-# in docker-compose.yml or the k8s manifest's env/configMap, not baked in here.
+# deploy-specific — set via env_file in docker-compose.yml or the k8s
+# manifest's env/configMap, not baked in here. InfluxDB3 host/token and MQTT
+# broker/credentials are deploy-specific too, but live in infra.json (see
+# infra_config.go) instead — mounted at /infra.json (this image's working
+# directory is /, so the default relative "infra.json" resolves there), not
+# baked in here either.
 
 ENTRYPOINT ["/go/bin/parse-mqtt-to-influxdb3"]

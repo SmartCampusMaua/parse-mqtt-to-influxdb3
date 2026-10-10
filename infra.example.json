@@ -1,0 +1,12 @@
+{
+  "version": "1",
+  "influxdb": {
+    "host": "http://influxdb.maua.br:8181",
+    "token": ""
+  },
+  "mqtt": {
+    "broker": "mqtt.maua.br:1883",
+    "username": "",
+    "password": ""
+  }
+}

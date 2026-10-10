@@ -1137,13 +1137,20 @@ func main() {
 		log.Println("No .env file found; using environment variables")
 	}
 
-	MQTT_BROKER := os.Getenv("MQTT_BROKER")
-
-	INFLUXDB_HOST := os.Getenv("INFLUXDB_HOST")
-	if INFLUXDB_HOST == "" {
-		INFLUXDB_HOST = "http://influxdb.maua.br:8181"
+	// INFRA_CONFIG_FILE holds InfluxDB3 + MQTT connection details (host,
+	// token, broker, credentials) — see infra_config.go's doc comment for
+	// why this is a JSON file rather than env vars.
+	INFRA_CONFIG_FILE := os.Getenv("INFRA_CONFIG_FILE")
+	if INFRA_CONFIG_FILE == "" {
+		INFRA_CONFIG_FILE = "infra.json"
 	}
-	INFLUXDB_TOKEN := os.Getenv("INFLUXDB_TOKEN")
+	infraCfg, err := loadInfraConfig(INFRA_CONFIG_FILE)
+	if err != nil {
+		log.Fatalf("[infra] %v", err)
+	}
+	INFLUXDB_HOST := infraCfg.InfluxDB.Host
+	INFLUXDB_TOKEN := infraCfg.InfluxDB.Token
+
 	// REGISTRY_API_URL points at the SmartCampusMaua `api` repo's registry
 	// endpoints (devices/assets/sensors/modbus-channels) — the source of
 	// truth for all four now, replacing this repo's own JSON files. Reads
@@ -1177,7 +1184,6 @@ func main() {
 	// Initialize all four InfluxDB3 clients on the same host+token.
 	// Database names are hardcoded; each client writes to a different database.
 	var clients DBClients
-	var err error
 
 	// Create iot_sensors client
 	clients.IoTSensors, err = influxdb3.New(influxdb3.ClientConfig{
@@ -1328,10 +1334,10 @@ func main() {
 
 	id := uuid.New().String()
 	mqttOpts := MQTT.NewClientOptions().
-		AddBroker(MQTT_BROKER).
+		AddBroker(infraCfg.MQTT.Broker).
 		SetClientID("parse-lns-sub-" + id).
-		SetUsername("public").
-		SetPassword("public").
+		SetUsername(infraCfg.MQTT.Username).
+		SetPassword(infraCfg.MQTT.Password).
 		SetConnectionLostHandler(func(_ MQTT.Client, err error) {
 			log.Printf("MQTT connection lost: %v", err)
 			select {
@@ -1349,7 +1355,7 @@ func main() {
 	if tok := mqttClient.Connect(); tok.Wait() && tok.Error() != nil {
 		panic(tok.Error())
 	}
-	log.Printf("MQTT: connected to %s", MQTT_BROKER)
+	log.Printf("MQTT: connected to %s", infraCfg.MQTT.Broker)
 
 	// Subscribe to  device/DEVICE_ID/telemetry  or the broader wildcard below.
 	subTopic := "device/+/telemetry"
