@@ -12,13 +12,14 @@ services:
       # inside this container, the shared zc2x influxdb3-core is reached by
       # its container name on the docker_default network.
       INFLUXDB_HOST: http://influxdb3-core:8181
+      # Same reasoning: the `api` repo's registry service currently runs
+      # directly on the host (bun run src/index.ts), not as a container on
+      # this network — host.docker.internal is Docker Desktop's route to the
+      # host. The real k8s deployment points this at that API's in-cluster
+      # Service address instead (see the `api` repo's own manifest).
+      REGISTRY_API_URL: http://host.docker.internal:3333
     networks:
       - zc2x
-    volumes:
-      - ../devices.json:/etc/mqtt-to-influxdb3/devices.json:ro
-      - ../assets.json:/etc/mqtt-to-influxdb3/assets.json:ro
-      - ../sensors.json:/etc/mqtt-to-influxdb3/sensors.json:ro
-      - ../device_channels.json:/etc/mqtt-to-influxdb3/device_channels.json:ro
 
 networks:
   zc2x:

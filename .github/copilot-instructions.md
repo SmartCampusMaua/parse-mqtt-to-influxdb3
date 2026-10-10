@@ -15,11 +15,29 @@ MQTT → detectProvider → resolveIncomingDevice → parseMsg
      → registry.DecodeLNS / registry.ParseCustom
      → vendor.Decode / vendor.Parse
      → []SensorDataRecord
-     → writeSensorRecords → InfluxDB3
+     → buildSensorPoints → batchWriter.Enqueue → InfluxDB3
 ```
 
-Device registry is loaded from `devices.json` at startup and hot-reloaded every
-`DEVICE_REGISTRY_REFRESH_SEC` seconds (default 30) without restarting.
+## Write batching
+
+Decode workers run fully in parallel (`WRITE_WORKERS`, default 2×GOMAXPROCS)
+but never call InfluxDB3 directly — each hands its points to a shared
+`batchWriter` over a channel. One goroutine per database (`sensor_data`,
+`raw`) is the only thing that ever calls `WritePoints`, flushing on a timer
+(`WRITE_FLUSH_INTERVAL_SEC`, default 5s) or once buffered points reach
+`WRITE_BATCH_SIZE` (default 5000), whichever comes first. This exists because
+one `WritePoints` call per MQTT message from every worker independently
+fragmented InfluxDB3's Parquet files within a single time window, inflating
+the file count time-range queries must scan past InfluxDB3's file-scan cap.
+Batch failures retry, then fall back to per-point writes; shutdown (signal or
+MQTT connection loss) drains and flushes whatever's buffered before exit.
+
+Device registry is fetched from the SmartCampusMaua `api` repo's registry
+endpoints (`GET {REGISTRY_API_URL}/api/registry/v0.1/devices`, plain
+unauthenticated GET) at startup and hot-reloaded every
+`DEVICE_REGISTRY_REFRESH_SEC` seconds (default 30) without restarting. Assets/
+sensors/Modbus-channels come from that same API's `/assets`, `/sensors`, and
+`/modbus-channels` endpoints.
 
 ## Decoder file layout
 
@@ -49,7 +67,7 @@ go-parse/devices/
 Registry and vendor maps use `MODEL_SUBMODEL` (uppercase). Fallback to `MODEL`
 is handled automatically by `lookupKeys()` in `registry.go`.
 
-| Map key            | devices.json                                 |
+| Map key            | device_model (registry API)                  |
 | ------------------ | -------------------------------------------- |
 | `"DTL"`            | `deviceModel=DTL` (no submodel)              |
 | `"NIT21LI_EMW104"` | `deviceModel=NIT21LI, deviceSubmodel=EMW104` |
@@ -86,7 +104,7 @@ Four databases on same host/token: `iot_sensors`, `audit_iot`, `vehicle_telemetr
    - export `Decode<ModelSubmodel>(payload []byte, deviceID, provider string, ts time.Time) []record.SensorDataRecord`
 2. Add `"MODEL_SUBMODEL": decode<ModelSubmodel>` to the vendor's decoder map
 3. Add `"MODEL_SUBMODEL": ...vendor.Decode...` to `lnsParsers` in `registry/registry.go`
-4. Add entries to `devices.json` with `"deviceModel": "MODEL"` and `"deviceSubmodel": "SUBMODEL"`
+4. Register the device via `POST /api/registry/v0.1/devices` on the registry API with `"device_model": "model_submodel"` (already merged, lowercase)
 
 ## Conventions
 
@@ -102,6 +120,9 @@ Four databases on same host/token: `iot_sensors`, `audit_iot`, `vehicle_telemetr
 ```sh
 go build ./...
 go vet ./...
+go test ./...
 ```
 
-No external test infrastructure required. The build failing is the signal.
+No external test infrastructure required — the unit tests use in-process
+fakes (e.g. `batch_writer_test.go`'s fake `influxWriter`) rather than a live
+MQTT broker or InfluxDB3 instance.

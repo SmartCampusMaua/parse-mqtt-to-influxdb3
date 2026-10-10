@@ -39,11 +39,12 @@ type SensorDataRecord struct {
 	DeviceIndex int
 	DevEUI      string // LoRaWAN devices only
 	MacAddress  string // IP/WiFi devices only
-	// AssetID is resolved from assets.json via the device's asset assignment
-	// (main.go's mergeAssetInfo) — never set by decoders. Empty when the
-	// device isn't assigned to any asset yet; asset_coords is deliberately
-	// never written here (or to InfluxDB3) — it's static per-asset metadata,
-	// resolved by lookup rather than duplicated on every point.
+	// AssetID is resolved from the registry API's device/sensor rows (see
+	// main.go's effectiveAssetID) — never set by decoders. Empty when
+	// neither the device nor its sensor is assigned to an asset yet. Asset
+	// metadata (name, coords, ...) is deliberately never written here (or to
+	// InfluxDB3) — it's static, resolved by lookup rather than duplicated on
+	// every point.
 	AssetID   string
 	Provider  string
 	Timestamp time.Time

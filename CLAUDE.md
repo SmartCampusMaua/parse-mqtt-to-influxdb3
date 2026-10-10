@@ -10,7 +10,7 @@ Go service. Subscribes to MQTT → decodes binary/JSON payloads → writes
 ## Decode chain
 
 ```
-devices.json → GetDevicesMap() → deviceMap / devEUIToDeviceID
+Registry API (GET {REGISTRY_API_URL}/api/registry/v0.1/devices) → GetDevicesMap() → deviceMap / devEUIToDeviceID
 MQTT message → detectProvider → resolveIncomingDevice → parseMsg
            → chirpstack/everynet.Parse → LNSFrame
            → registry.DecodeLNS(model, submodel, payload, ...)
@@ -18,8 +18,21 @@ MQTT message → detectProvider → resolveIncomingDevice → parseMsg
                → lnsParsers["MODEL_SUBMODEL"] → vendor.Decode()
                    → binaryDecoders["MODEL_SUBMODEL"] → decode<X>()
                        → []SensorDataRecord
-           → writeSensorRecords → InfluxDB3 iot_sensors
+           → buildSensorPoints → sensorWriter.Enqueue (batchWriter) → InfluxDB3 iot_sensors
 ```
+
+## Write batching
+
+Decode workers never call InfluxDB3 directly. Each hands its points to a
+shared `batchWriter` (`cmd/parse-mqtt-to-influxdb3/main.go`) over a channel;
+one goroutine per database (`sensor_data`, `raw`) is the only thing that ever
+calls `WritePoints`, flushing on a timer (`WRITE_FLUSH_INTERVAL_SEC`, default
+5s) or a size threshold (`WRITE_BATCH_SIZE`, default 5000 points), whichever
+comes first. This exists because one `WritePoints` call per MQTT message from
+every worker independently fragments InfluxDB3's Parquet files across a time
+window, inflating the file count time-range queries must scan. Batch write
+failures retry, then fall back to per-point writes; shutdown (signal or MQTT
+connection loss) drains and flushes buffered points before exit.
 
 ## File layout — one file per device codec
 
@@ -33,7 +46,7 @@ go-parse/devices/
 
 ## Routing key table (always uppercase)
 
-| File                | Vendor map key     | Registry key       | devices.json                                 |
+| File                | Vendor map key     | Registry key       | device_model (registry API)                  |
 | ------------------- | ------------------ | ------------------ | -------------------------------------------- |
 | `dtl200.go`         | `"DTL"`            | `"DTL"`            | `deviceModel=DTL`                            |
 | `nit21li_emw104.go` | `"NIT21LI_EMW104"` | `"NIT21LI_EMW104"` | `deviceModel=NIT21LI, deviceSubmodel=EMW104` |
@@ -48,7 +61,7 @@ go-parse/devices/
 `sensor_data` tags: `sensor_type`, `device_model`, `device_id`, `provider`, `dev_eui`\*
 
 `device_model` = lowercase merged model+submodel (e.g. `em300_di`, `nit21li_emw104`).
-Merge happens in `writeSensorRecords` — decoders use `const dm = "em300"` (base model only).
+Merge happens in `buildSensorPoints` — decoders use `const dm = "em300"` (base model only).
 `dev_eui` written only for LoRaWAN providers.
 
 ## Conventions
@@ -66,11 +79,12 @@ Merge happens in `writeSensorRecords` — decoders use `const dm = "em300"` (bas
 1. `go-parse/devices/<vendor>/<model>_<submodel>.go` — implement `decode<X>` and `Decode<X>`
 2. Add `"MODEL_SUBMODEL": decode<X>` to vendor map in `<vendor>.go`
 3. Add `"MODEL_SUBMODEL": ...vendor.Decode...` to `lnsParsers` in `registry/registry.go`
-4. Add entries with `"deviceModel": "MODEL", "deviceSubmodel": "SUBMODEL"` to `devices.json`
+4. Register the device via `POST /api/registry/v0.1/devices` on the registry API with `"device_model": "model_submodel"` (already merged, lowercase)
 
 ## Build
 
 ```sh
 go build ./...
 go vet ./...
+go test ./...
 ```

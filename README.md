@@ -4,6 +4,13 @@ Subscribes to MQTT, auto-detects the message provider, decodes the binary or
 JSON payload, and writes one **`sensor_data`** point per decoded field directly
 to an InfluxDB3 Core instance.
 
+Device/asset/sensor/Modbus-channel registry data is **not** owned by this
+repo — it's fetched over plain `GET` from the SmartCampusMaua `api` repo's
+Postgres-backed registry endpoints (`REGISTRY_API_URL`, see
+[Environment variables](#environment-variables)), polled on the same
+hot-reload timer this repo has always used. This repo never writes to that
+API; every read route on it is open, no token needed.
+
 ---
 
 ## InfluxDB3 measurement schema
@@ -19,7 +26,7 @@ to an InfluxDB3 Core instance.
 
 `device_model` is the **merged** model+submodel key in lowercase, e.g.:
 
-| `device_model` in devices.json | `device_model` tag in InfluxDB3 |
+| `device_model` in the registry API | `device_model` tag in InfluxDB3 |
 | ------------------------------- | -------------------------------- |
 | `"dtl200"`                      | `dtl200`                         |
 | `"nit21li_emw104"`              | `nit21li_emw104`                 |
@@ -45,12 +52,11 @@ This single merged tag eliminates a redundant index dimension. Queries are
 
 `*` `dev_eui` is written only for LoRaWAN providers (`chirpstackv4`, `everynet`).
 
-`**` `sensor_id` is written only when the record resolves to an entry in
-[`sensors.json`](#sensor-registry-sensorsjson) — every non-UC decoder resolves
-it by `(device_id, sensor_type, device_index)`; UC100/UC300/UC501 resolve it
-by Modbus/IO channel via
-[`device_channels.json`](#device-channel-registry-device_channelsjson). Empty
-when unregistered.
+`**` `sensor_id` is written only when the record resolves to an entry in the
+[sensor registry](#sensor-registry) — every non-UC decoder resolves it by
+`(device_id, sensor_type, device_index)`; UC100/UC300/UC501 resolve it by
+Modbus/IO channel via the
+[Modbus channel registry](#modbus-channel-registry). Empty when unregistered.
 
 ### `raw` — audit measurement in `audit_iot` database
 
@@ -62,7 +68,7 @@ when unregistered.
 | timestamp   | ingestion time (time.Now() at message receipt)           |
 
 \* `asset_id` is a snapshot of whichever asset the device was assigned to at
-that instant (see [assets.json](#asset-registry-assetsjson)) — omitted when
+that instant (see [Asset registry](#asset-registry)) — omitted when
 unassigned. `raw` is already a continuous, timestamped record of every
 message, so the full assignment history is reconstructable from it without
 any separate change-tracking.
@@ -92,15 +98,12 @@ Four InfluxDB3 databases are initialised simultaneously on the same host and tok
 ```
 .
 ├── main.go                    MQTT loop · provider detection · InfluxDB3 writer
-│                              GetDevicesMap (loads + reloads devices.json)
-│                              GetAssetsMap (loads + reloads assets.json)
-│                              GetSensorsMap (loads + reloads sensors.json)
-│                              GetDeviceChannelsMap (loads + reloads device_channels.json)
+│                              GetDevicesMap (fetches + reloads GET .../devices)
+│                              GetAssetIDSet (fetches + reloads GET .../assets, existence-check only)
+│                              GetSensorsMap (fetches + reloads GET .../sensors)
+│                              GetDeviceChannelsMap (fetches + reloads GET .../modbus-channels)
 │                              resolveChannelRecord (UC100/UC300/UC501 channel → sensor resolution)
-├── devices.json               Runtime device registry (model/devEui)
-├── assets.json                Runtime asset registry (asset_id/coords/device_ids)
-├── sensors.json                Runtime sensor registry (sensor_id/sensor_type/device_index)
-├── device_channels.json        Runtime UC-series Modbus/IO channel routing
+│                              effectiveAssetID (sensor's own asset_id override, else its device's)
 ├── record/
 │   └── record.go              SensorDataRecord · SensorTypes singleton (ST)
 └── go-parse/
@@ -174,7 +177,8 @@ Each file owns exactly one device codec. Naming pattern: **`model_submodel.go`**
 2. Add `"EM310_TILT": decodeEM310TILT` to `modelDecoders` in `milesight.go`; if it introduces new
    `(channel, type)` byte pairs, add their lengths to `genericTypeLengths` / `channelTypeOverride`
 3. Add `"EM310_TILT": ...milesight.Decode...` to `lnsParsers` in `registry/registry.go`
-4. Add device entries with `"device_model": "em310_tilt"` in `devices.json`
+4. Register the physical device via the registry API (`POST /api/registry/v0.1/devices`,
+   `{"device_model": "em310_tilt", ...}`) — see [Device registry](#device-registry)
 5. In `record.go`: reuse an existing `SensorTypes` field where the physical
    quantity and unit already match (e.g. `battery_level`); add a new field
    only when nothing fits. Follow the [naming convention](#naming-convention-for-sensor_type) below.
@@ -199,8 +203,9 @@ Each file owns exactly one device codec. Naming pattern: **`model_submodel.go`**
   computes or stores.
 - If a channel's real-world meaning genuinely can't be known by the decoder
   (site-wired RS485/GPIO, e.g. UC100/UC300/UC501) rather than merely being
-  multi-instance, use `ModbusChannel`/`IOChannel` + `device_channels.json`
-  instead of `DeviceIndex` — see the [naming convention](#naming-convention-for-sensor_type)
+  multi-instance, use `ModbusChannel`/`IOChannel` + the
+  [Modbus channel registry](#modbus-channel-registry) instead of
+  `DeviceIndex` — see the [naming convention](#naming-convention-for-sensor_type)
   section for the distinction between the two mechanisms.
 
 ---
@@ -208,18 +213,20 @@ Each file owns exactly one device codec. Naming pattern: **`model_submodel.go`**
 ## Decode chain (end to end)
 
 ```
-devices.json     assets.json    sensors.json         device_channels.json
-  → GetDevicesMap() → GetAssetsMap() → GetSensorsMap()  → GetDeviceChannelsMap()
-    deviceMap[..]=     deviceID ->      sensorMap[sensorID]  deviceChannels[deviceID]
-    DeviceConfig       AssetConfig      = {SensorType,        = {Modbus[chn]->sensorID,
-                                            DeviceID,             IO[chn]->sensorID}
-                                            DeviceIndex,
-                                            SensorName}
-        ↓                   ↓                  ↓                        ↓
-  mergeAssetInfo()    buildSensorIndex(sensorMap)
-  backfills asset      → sensorIndex[deviceID+sensorType+deviceIndex] = sensorID
-  info onto             (deviceIndex=0 for every single-instance sensor_type —
-  DeviceConfig            behaves exactly like the old deviceID+sensorType key)
+GET .../devices        GET .../assets       GET .../sensors        GET .../modbus-channels
+  → GetDevicesMap()      → GetAssetIDSet()    → GetSensorsMap()       → GetDeviceChannelsMap()
+    deviceMap[id]=          validAssetIDs        sensorMap[id]           deviceChannels[deviceID]
+    DeviceConfig            = {id: true}         = {SensorType,          = {Modbus[chn]->sensorID,
+    (AssetID inline                                 DeviceID,               IO: always empty —
+    from the row)                                   DeviceIndex,            no io-channels endpoint
+                                                     SensorName,             yet}
+                                                     AssetID}   ← override
+        ↓                       ↓                       ↓                        ↓
+                          validateAssetReferences()   buildSensorIndex(sensorMap)
+                          logs (never fails) any        → sensorIndex[deviceID+sensorType+deviceIndex]
+                          device/sensor asset_id           = sensorID
+                          not in validAssetIDs           (deviceIndex=0 for every single-instance
+                                                           sensor_type)
 
 MQTT message arrives on  device/<identifier>/telemetry
   → detectProvider()           → "chirpstackv4" | "everynet" | "custom"
@@ -233,25 +240,59 @@ MQTT message arrives on  device/<identifier>/telemetry
                                        everything else: SensorType set directly, DeviceIndex set when
                                        the device carries more than one sensor of that type)
   → per record, in parseDeviceModel:
+      → r.AssetID = config.AssetID (device's own home asset, the default)
       → ModbusChannel/IOChannel != 0?  resolveChannelRecord(): deviceChannels[deviceID].Modbus/.IO[chn]
                                         → sensorID → sensorMap[sensorID].SensorType
-                                        → no config entry? record dropped (logged), never written
+                                        → no registry entry? record dropped (logged), never written
                                           under an empty/made-up sensor_type
       → otherwise:                     sensorIndex[deviceID+sensorType+deviceIndex] → SensorID (if registered)
-  → writeSensorRecords()
+      → SensorID resolved?             r.AssetID = effectiveAssetID(r.AssetID, sensorMap[SensorID])
+                                        → sensor's own asset_id override wins if set, else the
+                                          device-level default stands — see the bus-listening-device
+                                          rationale in the Sensor registry section below
+  → buildSensorPoints()
       → device_model tag = lowercase(model + "_" + submodel)
-      → sensor_data point per record (sensor_id tag set when resolved) → InfluxDB3 iot_sensors
+      → sensor_data point per record (sensor_id/asset_id tags set when resolved)
+  → sensorWriter.Enqueue(points)  → batchWriter flushes to InfluxDB3 iot_sensors
+                                     (see "Write batching" below)
 ```
 
 All lookups are O(1) map operations. No type switches, no reflect.
 
-`assets.json` is decoupled from `devices.json` on purpose: `AssetConfig` is
-resolved separately and only merged into each `DeviceConfig` in memory. No
-decoder currently reads `AssetID`/`AssetCoords` — it's carried on
-`DeviceConfig` for future consumers (e.g. a geo-tagging writer). Because
-nothing downstream depends on it, a bad/missing `assets.json` logs a warning
-and starts with zero asset links rather than crashing the service, unlike a
-bad `devices.json`, which is fatal (see [Asset registry](#asset-registry-assetsjson) below).
+### Write batching
+
+Decode workers (`WRITE_WORKERS` of them, running fully in parallel) never call
+InfluxDB3 directly. Each one hands its finished points to a single shared
+`batchWriter` over a channel instead — one dedicated goroutine per database
+(`sensor_data` and `raw`) is the only thing that ever calls `WritePoints`.
+That writer accumulates points into a buffer and flushes on whichever comes
+first: `WRITE_FLUSH_INTERVAL_SEC` elapsing, or the buffer reaching
+`WRITE_BATCH_SIZE` points.
+
+This exists because many small, uncoordinated concurrent writers (one
+`WritePoints` call per MQTT message, from every decode worker independently)
+fragment InfluxDB3 Core's Parquet storage — multiple files end up covering
+the same time window instead of one, which multiplies the effective file
+count any time-range query has to scan and can exceed
+`INFLUXDB3_QUERY_FILE_LIMIT`. Funneling every write through one goroutine per
+database means one flush produces one file per window instead.
+
+If a consolidated batch write fails, it's retried as a whole first; if it
+still fails, the writer falls back to writing points individually so one bad
+record doesn't drop the rest of that flush interval's data. On shutdown
+(SIGINT/SIGTERM, or an MQTT connection loss that forces a restart) the writer
+drains and flushes whatever is currently buffered before the process exits.
+
+The asset registry fetch (`GetAssetIDSet`) is decoupled from the device/sensor
+fetches on purpose: a device's or sensor's `asset_id` comes straight from its
+own row now (no cross-referencing needed), so `GetAssetIDSet` exists purely
+to validate those inline values against the currently-known asset set —
+`validateAssetReferences` logs a warning for anything stale, never fails a
+reload. Because nothing downstream depends on the asset id set actually
+resolving anything (only on logging), a bad/unreachable asset fetch logs a
+warning and starts with zero validation rather than crashing the service,
+unlike a bad device fetch, which is fatal at startup (see
+[Asset registry](#asset-registry) below).
 
 ---
 
@@ -286,7 +327,7 @@ generic `sensor_type` plus `SensorDataRecord.DeviceIndex` to tell multiple
 same-type sensors on one device apart (e.g. `lnv3_sm3dl`'s three
 `soil_moisture_raw` probes are `device_index` 1/2/3, not `smdl1/2/3`).
 `DeviceIndex` is purely a **resolution key** — it disambiguates which
-`sensor_id` a reading belongs to via `sensors.json`'s own `device_index`
+`sensor_id` a reading belongs to via the sensor registry's own `device_index`
 field, and is **never written to InfluxDB3**; once `sensor_id` is resolved
 it has done its only job. This is a different mechanism from
 `ModbusChannel`/`IOChannel` (UC100/300/501): those exist because the
@@ -614,17 +655,22 @@ Modbus channel (or, on UC300/UC501, a GPIO/analog-input/PT100 pin) measures
 is entirely site configuration, not something the decoder can know.
 `decodeUC100`/`decodeUC300`/`decodeUC501` extract `(ModbusChannel, value)` or
 `(IOChannel, value)` pairs only; `sensor_type` and `sensor_id` are filled in
-afterward by `resolveChannelRecord` (main.go) from
-[`device_channels.json`](#device-channel-registry-device_channelsjson)
-+ [`sensors.json`](#sensor-registry-sensorsjson) — see the [decode chain](#decode-chain-end-to-end)
-above. A channel with no `device_channels.json` entry is dropped (logged),
+afterward by `resolveChannelRecord` (main.go) from the
+[Modbus channel registry](#modbus-channel-registry)
++ [Sensor registry](#sensor-registry) — see the [decode chain](#decode-chain-end-to-end)
+above. A channel with no Modbus channel registry entry is dropped (logged),
 never written under an empty or made-up `sensor_type`. This is why none of
 these three devices' fixed I/O needed a new `sensor_type` name discussed up
 front, despite this repo's [naming convention](#naming-convention-for-sensor_type)
 requiring exactly that for every other device: the physical meaning of a
-channel is attributed entirely through `device_channels.json` + `sensors.json`
-at deploy time (reusing an already-registered `sensor_type`, or a newly
-discussed one), the same as a Modbus channel — never invented in Go. `uc501`
+channel is attributed entirely through the Modbus channel registry + sensor
+registry at deploy time (reusing an already-registered `sensor_type`, or a
+newly discussed one), the same as a Modbus channel — never invented in Go.
+UC300/UC501's fixed-hardware IO channels (GPIO/PT100/ADC) currently have no
+registry endpoint to resolve against at all (see
+[Modbus channel registry](#modbus-channel-registry)'s note on this) — every
+IO-channel reading is dropped today, a known gap rather than a design choice.
+`uc501`
 does have one fixed reading, `battery_level` — its own battery isn't
 site-configurable the way an attached RS485/GPIO instrument is.
 
@@ -740,145 +786,162 @@ The MQTT topic follows `device/<identifier>/telemetry`.
 
 ---
 
-## Device registry (`devices.json`)
+## Device registry
 
-Loaded at startup, reloaded every `DEVICE_REGISTRY_REFRESH_SEC` seconds (default 30)
-without restarting the process. If the new file fails validation the previous registry
-stays active and a warning is logged — the service never crashes on a bad hot-reload.
+Fetched from `GET {REGISTRY_API_URL}/api/registry/v0.1/devices` at startup,
+re-fetched every `DEVICE_REGISTRY_REFRESH_SEC` seconds (default 30) without
+restarting the process. If a reload fetch fails (network error, non-200,
+unparseable body) or fails validation, the previous registry stays active
+and a warning is logged — the service never crashes on a bad hot-reload.
 
-A bad **initial** load (at startup) is fatal — `devices.json` is essential
-routing data.
+A bad **initial** fetch (at startup) is fatal — the device registry is
+essential routing data.
 
-Asset assignment (`asset_id`, geolocation) is **not** part of this file — see
-[Asset registry (`assets.json`)](#asset-registry-assetsjson) below.
+Each row's own `asset_id` **is** part of this response now (unlike the old
+`devices.json`, which kept asset assignment in a separate file) — see
+[Asset registry](#asset-registry) below for why a device's `asset_id` alone
+isn't always the *effective* asset for one of its sensors.
 
 ### Field reference
+
+Response shape from `GET .../devices` (one row per device; `null` fields
+unmarshal to Go zero values, same effect as an omitted key in the old JSON
+files):
 
 | field                 | type                  | required                  | notes                                                 |
 | ----------------------- | ----------------------- | ---------------------------- | ---------------------------------------------------------- |
-| `version`             | string                | —                         | top-level; log-only; bump when schema changes         |
-| `device_id`           | UUIDv7                | **mandatory**             | unique device identifier                              |
+| `id`                  | UUID                  | **mandatory**             | unique device identifier (this row's own id — see the `id` vs `device_id` naming note below) |
 | `device_model`        | string                | **mandatory**             | merged model+submodel key, e.g. `"em500_swl"`         |
 | `device_type`         | `"lorawan"` \| `"ip"` | **mandatory**             | determines which hardware id is required              |
-| `serial_number`       | string                | **mandatory**             | physical serial; use `""` if unknown (warning logged) |
+| `serial_number`       | string or `null`      | recommended                | physical serial; empty/`null` logs a warning          |
 | `dev_eui`             | 16 hex chars          | **mandatory** for lorawan | EUI-64 identifier                                     |
 | `mac_address`         | MAC address           | **mandatory** for ip      | any format accepted by `net.ParseMAC`                 |
-| `battery_voltage_max` | float                 | optional                  | V, defaults to 4.2 (LiPo/Li-Ion)                      |
-| `battery_voltage_min` | float                 | optional                  | V, defaults to 3.3 (LoRa safe minimum)                |
-| `probe_range_m`       | float                 | optional                  | DTL series: full-scale probe range in metres          |
-| `allow`               | bool                  | optional                  | set `false` to disable without removing the entry     |
+| `battery_voltage_max` | float or `null`       | optional                  | V, defaults to 4.2 (LiPo/Li-Ion)                      |
+| `battery_voltage_min` | float or `null`       | optional                  | V, defaults to 3.3 (LoRa safe minimum)                |
+| `probe_range_m`       | float or `null`       | optional                  | DTL series: full-scale probe range in metres          |
+| `allow`               | bool                  | `NOT NULL DEFAULT true` on the API's side | `false` disables ingestion without deleting the row |
+| `asset_id`            | UUID or `null`        | optional                  | this device's own "home" asset — see [Asset registry](#asset-registry) |
 
-### Full example with all options
+**The `id` vs `device_id` naming trap:** this endpoint's own row identifier
+is `id`, not `device_id` — unlike the old `devices.json`, where the entity
+was named after itself. Foreign keys pointing *at* a device from other
+endpoints (`apiSensor.DeviceID`, `apiModbusChannel.DeviceID`) correctly keep
+the descriptive `device_id` name; only an entity's *own* identifier changed.
+
+### Example response
 
 ```json
-{
-  "version": "1",
-  "devices": [
-    {
-      "device_id": "019b9ae2-fc84-7396-9ea8-fd2a041b7664",
-      "device_model": "em500_swl",
-      "device_type": "lorawan",
-      "serial_number": "SN-EM500-001",
-      "dev_eui": "24e124126d284622",
-      "battery_voltage_max": 4.2,
-      "battery_voltage_min": 3.3
-    },
-    {
-      "device_id": "019b08df-26e7-7506-a5f6-916b2bef24f4",
-      "device_model": "ks3000_wifi",
-      "device_type": "ip",
-      "serial_number": "SN-KS3000-001",
-      "mac_address": "aa:bb:cc:dd:ee:ff"
-    },
-    {
-      "allow": false,
-      "device_id": "019be702-190b-78be-ad3f-599935f7745c",
-      "device_model": "ks3000_lora",
-      "device_type": "lorawan",
-      "serial_number": "",
-      "dev_eui": "303331395230870e"
-    }
-  ]
-}
+[
+  {
+    "id": "019b9ade-55a0-746e-8d41-b2537631441c",
+    "device_model": "em300_di",
+    "device_type": "lorawan",
+    "serial_number": null,
+    "dev_eui": "24e124136f315508",
+    "mac_address": null,
+    "battery_voltage_max": null,
+    "battery_voltage_min": null,
+    "probe_range_m": null,
+    "allow": true,
+    "asset_id": "01a08185-4622-7324-a87d-4d7fff5df769"
+  }
+]
 ```
 
-**Validation rules (applied on every load):**
+**Validation rules (applied on every fetch):**
 
-- `device_id` must be a valid UUIDv7 (`xxxxxxxx-xxxx-7xxx-...`)
+- `id` must be a syntactically valid UUID — any version, not specifically
+  UUIDv7 (see the note on `isUUID` below)
 - `device_type` must be `"lorawan"` or `"ip"` (case-insensitive)
 - `dev_eui` must be present and 16 hex chars for `lorawan` devices
 - `mac_address` must be a valid MAC address for `ip` devices
-- Duplicate `device_id` or `dev_eui` causes the whole file to be rejected
-- Missing `serial_number` field (key absent, not empty) is a hard error; empty value is a warning
+- Duplicate `id` or `dev_eui` across rows causes the whole fetch to be rejected
+- Missing/empty `serial_number` is a warning, not a hard error
+- Rows with `allow: false` are skipped entirely (never enter `deviceMap`)
+
+**On UUID versions:** the original bootstrap-imported rows (from this repo's
+old `devices.json`/`sensors.json`/`assets.json`) are UUIDv7, this repo's own
+long-standing convention. The registry API's own writes mint plain
+`crypto.randomUUID()` v4 ids instead. `isUUID` in `main.go` only checks basic
+UUID shape, not version, specifically so newly-created rows from that API
+don't get rejected by a v7-only check that made sense for the old
+file-based registry but doesn't apply to Postgres-backed data.
 
 ---
 
-## Asset registry (`assets.json`)
+## Asset registry
 
-Physical asset metadata (`asset_id`, geolocation) lives here, **decoupled**
-from `devices.json` — a device is a piece of hardware with a model and
-routing identity; an asset is the physical thing it's mounted on (a tree, a
-tank, a vehicle, a room). One asset can carry multiple devices (e.g. a
-`lnv3_sm3dl` soil probe and an `lnv3_svc` valve controller on the same
-irrigation zone) via the asset's own `device_ids` array — the cross-reference
-lives on the asset side, not duplicated on every device.
+Physical asset metadata (name, slug, geolocation, parent-asset hierarchy)
+lives on `GET {REGISTRY_API_URL}/api/registry/v0.1/assets` — a device is a
+piece of hardware with a model and routing identity; an asset is the
+physical thing it's mounted on (a tree, a tank, a vehicle, a room).
 
-Loaded at startup and reloaded on the same `DEVICE_REGISTRY_REFRESH_SEC`
-interval as `devices.json`. Unlike `devices.json`, a bad or missing
-`assets.json` is **non-fatal**: it logs a warning and the service starts (or
-keeps running, on a reload) with the last known-good asset links — no
-decoder actually reads `AssetID`/`AssetCoords` today, so there's nothing to
-crash.
+**This repo only ever fetches asset `id`s, never asset metadata.** Unlike
+the old `assets.json` (which cross-referenced devices via each asset's own
+`device_ids` array), a device's `asset_id` now comes straight from its own
+row on `GET .../devices` — no separate merge step needed. `GetAssetIDSet`
+fetches the full set of currently-known asset ids purely so
+`validateAssetReferences` can log a warning (never fail a reload) if a
+device or sensor references an `asset_id` that doesn't actually exist —
+same soft-FK, lenient philosophy this repo has always used for cross-entity
+references that might just be a timing gap, not a real error.
 
-### Field reference
+Fetched at startup and re-fetched on the same `DEVICE_REGISTRY_REFRESH_SEC`
+interval as devices. Unlike the device fetch, a bad or unreachable asset
+fetch is **non-fatal**: it logs a warning and the service starts (or keeps
+running, on a reload) with the last known-good asset id set — nothing
+downstream depends on it resolving correctly, only on the warning firing
+when it doesn't.
 
-| field                 | type    | required      | notes                                                   |
-| ----------------------- | --------- | ---------------- | ------------------------------------------------------------ |
-| `version`             | string  | —              | top-level; log-only; bump when schema changes           |
-| `asset_id`            | UUIDv7  | **mandatory**  | unique asset identifier                                 |
-| `asset_coords`        | object  | optional       | `lat` [-90,90], `lng` [-180,180], `alt` (m)              |
-| `device_ids`          | array   | optional       | `device_id`s (from `devices.json`) mounted on this asset; each must be a valid UUIDv7 |
+### The sensor-level override: `sensor.asset_id ?? device.asset_id`
 
-### Full example
+A device's own `asset_id` is its "home" location. But a **bus-listening**
+device — e.g. a UC300 relaying Modbus readings for several instruments on
+one RS485 bus — can be physically mounted on one asset while some of the
+sensors it relays actually belong to a *different* asset reachable on that
+same bus. For exactly that case, `GET .../sensors` rows carry their own
+optional `asset_id` override (see [Sensor registry](#sensor-registry)
+below), independent of their device's.
+
+**The effective asset for any sensor's reading is `sensor.asset_id` if set,
+else its device's own `asset_id`** — computed by `effectiveAssetID` in
+`main.go`, applied in `parseDeviceModel` right after a record's `SensorID`
+resolves. Getting this wrong — computing asset attribution from the device
+alone and ignoring the sensor's own override — would silently misattribute
+every such sensor's data to the wrong asset, with no error to indicate it.
+
+### Example response
 
 ```json
-{
-  "version": "1",
-  "assets": [
-    {
-      "asset_id": "019df4d6-f351-77a5-a3c2-926523251c47",
-      "asset_coords": { "lat": -23.565, "lng": -46.655, "alt": 760 },
-      "device_ids": [
-        "019b9ae2-fc84-7396-9ea8-fd2a041b7664",
-        "019be6eb-b5bb-7fbf-ba3b-3101febc1129"
-      ]
-    }
-  ]
-}
+[
+  {
+    "id": "01a08185-4622-7367-a948-c5a524744b8f",
+    "asset_name": "Asset 8",
+    "asset_slug": "asset-8",
+    "asset_coords": null,
+    "parent_asset_id": null
+  }
+]
 ```
 
-**Validation rules (applied on every load):**
-
-- `asset_id` must be a valid UUIDv7
-- `asset_coords.lat` must be in [-90, 90]; `lng` in [-180, 180]
-- Every entry in `device_ids` must be a valid UUIDv7
-- Duplicate `asset_id` causes the whole file to be rejected
-- A `device_id` listed under more than one asset is a soft warning (last one loaded wins), not a hard error
-- A `device_id` in `assets.json` with no matching entry in `devices.json` is not an error — it's simply never resolved to a live `DeviceConfig`
+Only `id` is actually parsed by this repo (`apiAsset` in `main.go`) — the
+rest of this shape is shown for completeness, not because anything here
+reads it.
 
 ---
 
-## Sensor registry (`sensors.json`)
+## Sensor registry
 
-Canonical registry of every **sensor** (one measurement stream), decoupled
-from `devices.json` on purpose. `sensor_id` is the **stable identity of a
-measurement stream** — assigned once (UUIDv7, not derived/hashed) and never
+Canonical registry of every **sensor** (one measurement stream), fetched
+from `GET {REGISTRY_API_URL}/api/registry/v0.1/sensors` and decoupled from
+the device registry on purpose. `sensor_id` (the row's `id`) is the
+**stable identity of a measurement stream** — assigned once and never
 recomputed; it persists across a device swap (repoint the `device_id` FK,
 `sensor_id` itself doesn't change). `sensor_type` lives **only here** — not
-duplicated into `device_channels.json`. This is a flat **pool** of sensors,
-not a hierarchy — `device_id` is a foreign key marking which hardware
-currently carries a sensor, not a container; a device is only "a hardware
-platform to deploy sensors on the field."
+duplicated into the Modbus channel registry. This is a flat **pool** of
+sensors, not a hierarchy — `device_id` is a foreign key marking which
+hardware currently carries a sensor, not a container; a device is only "a
+hardware platform to deploy sensors on the field."
 
 Not unique on `(device_id, sensor_type)` alone — two sensors can legitimately
 share both, disambiguated by `device_index`:
@@ -889,51 +952,55 @@ share both, disambiguated by `device_index`:
   `sensor_id`. This is the common case for non-UC devices.
 - **Different physical instruments on one RS485 bus** (e.g. two identical
   Modbus sensors on one UC300) — the decoder knows *neither*; resolved
-  instead by wire channel number via
-  [Device channel registry](#device-channel-registry-device_channelsjson),
+  instead by wire channel number via the
+  [Modbus channel registry](#modbus-channel-registry),
   which doesn't use `device_index` at all (the channel number already
   disambiguates).
 
-Loaded at startup and reloaded on the same `DEVICE_REGISTRY_REFRESH_SEC`
-interval as `devices.json`. Like `assets.json`, a bad or missing
-`sensors.json` is **non-fatal** — logs a warning and runs with an empty
-sensor index rather than crashing.
+Fetched at startup and re-fetched on the same `DEVICE_REGISTRY_REFRESH_SEC`
+interval as devices. Like assets, a bad or unreachable sensor fetch is
+**non-fatal** — logs a warning and runs with an empty sensor index rather
+than crashing.
 
 ### Field reference
 
-| field         | type   | required      | notes                                                        |
-| --------------- | -------- | ---------------- | ----------------------------------------------------------------- |
-| `version`     | string | —              | top-level; log-only; bump when schema changes                |
-| `sensor_id`   | UUIDv7 | **mandatory**  | unique sensor identifier — stable identity of a measurement stream |
-| `sensor_type` | string | **mandatory**  | must match a `record.SensorTypes` field (validated via `record.AllSensorTypes()`) |
-| `device_id`   | UUIDv7 | **mandatory**  | FK → `devices.json`; soft/lenient — no error if the device isn't found |
-| `device_index`| int    | optional       | disambiguates multiple sensors sharing `(device_id, sensor_type)`; omit for single-instance sensors — matches `record.SensorDataRecord.DeviceIndex`; never written to InfluxDB3 |
-| `sensor_name` | string | optional       | purely cosmetic human label (e.g. `"Depth 10cm"`); never used for resolution, never written to InfluxDB3 |
+Response shape from `GET .../sensors`:
 
-### Full example
+| field          | type              | required      | notes                                                        |
+| ---------------| ----------------- | ---------------- | ----------------------------------------------------------------- |
+| `id`           | UUID              | **mandatory**  | unique sensor identifier — stable identity of a measurement stream (this row's own id, not to be confused with the `device_id` FK below — see the naming note in [Device registry](#device-registry)) |
+| `sensor_type`  | string            | **mandatory**  | must match a `record.SensorTypes` field (validated via `record.AllSensorTypes()`) |
+| `device_id`    | UUID              | **mandatory**  | FK → device registry; soft/lenient — no error if the device isn't found |
+| `device_index` | int or `null`     | optional       | disambiguates multiple sensors sharing `(device_id, sensor_type)`; `null`/omitted for single-instance sensors — matches `record.SensorDataRecord.DeviceIndex`; never written to InfluxDB3 |
+| `sensor_name`  | string or `null`  | optional       | purely cosmetic human label (e.g. `"Depth 10cm"`); never used for resolution, never written to InfluxDB3 |
+| `asset_id`     | UUID or `null`    | optional       | **override**, independent of this sensor's device's own `asset_id` — see [Asset registry](#asset-registry)'s "effective asset" section for the bus-listening-device rationale |
+
+### Example response
 
 ```json
-{
-  "version": "1",
-  "sensors": [
-    { "sensor_id": "01a03953-9387-76dd-bc9f-ee2b674fed66", "sensor_type": "water_level", "device_id": "01a03953-9387-7631-b960-5d7f9305a67c" },
-    { "sensor_id": "01a03953-9387-76e9-b9dd-ce9662f2e172", "sensor_type": "battery_level", "device_id": "01a03953-9387-7631-b960-5d7f9305a67c" },
-    { "sensor_id": "01a03992-e6c6-75d1-9ba4-0999e88e0c37", "sensor_type": "soil_moisture_raw", "device_id": "019f708d-1d7f-7d24-9029-e84713cddb96", "device_index": 1, "sensor_name": "Depth 10cm" }
-  ]
-}
+[
+  {
+    "id": "01a03992-e6c6-71c5-9289-e46bf5c57325",
+    "sensor_type": "current_loop",
+    "device_id": "019c2f32-0637-7304-8bc3-bc5c58b2961c",
+    "device_index": null,
+    "sensor_name": null,
+    "asset_id": null
+  }
+]
 ```
 
-**Validation rules (applied on every load):**
+**Validation rules (applied on every fetch):**
 
-- `sensor_id` and `device_id` must be valid UUIDv7
+- `id` and `device_id` must be syntactically valid UUIDs (any version — see the note in [Device registry](#device-registry))
 - `sensor_type` must be a recognized `record.ST` value — add it to `record.go` first (after discussion; see [naming convention](#naming-convention-for-sensor_type)) if it's genuinely new
 - `device_index` must not be negative
-- Duplicate `sensor_id` causes the whole file to be rejected
-- Duplicate `(device_id, sensor_type, device_index)` tuple causes the whole file to be rejected — a genuine config error, not legitimate multi-instance disambiguation
-- A `device_id` with no matching `devices.json` entry is not an error — soft FK, same philosophy as `assets.json`
+- Duplicate `id` across rows causes the whole fetch to be rejected
+- Duplicate `(device_id, sensor_type, device_index)` tuple causes the whole fetch to be rejected — a genuine config error, not legitimate multi-instance disambiguation
+- A `device_id` with no matching device registry row is not an error — soft FK, same philosophy as the asset registry
 
 `buildSensorIndex` (main.go) derives a `(device_id, sensor_type, device_index)
--> sensor_id` lookup from this file for every non-UC decoder (`device_index`
+-> sensor_id` lookup from this fetch for every non-UC decoder (`device_index`
 defaults to `0` for single-instance sensors, matching the zero value decoders
 leave on `SensorDataRecord.DeviceIndex` when they never set it — so this is
 fully backward compatible with sensors that predate `device_index`). If a
@@ -944,59 +1011,74 @@ resolved arbitrarily.
 
 ---
 
-## Device channel registry (`device_channels.json`)
+## Modbus channel registry
 
-**UC100/UC300/UC501 only.** Routes a physical Modbus channel, or (UC300/UC501
-only) a fixed-hardware GPIO/PT100/ADC/analog-input channel, to a `sensor_id`.
-Deliberately carries **no** `sensor_type` — that lives only in
-`sensors.json`, looked up via the `sensor_id` here. This is what lets the
-resolution step tell two same-`sensor_type` instruments on one bus apart,
-since `sensors.json` alone can't (see above).
+**UC100/UC300/UC501 only.** Fetched from
+`GET {REGISTRY_API_URL}/api/registry/v0.1/modbus-channels` — routes a
+physical Modbus channel to a `sensor_id`. Already flattened/joined
+server-side (the underlying device→bus→channel table structure isn't
+exposed; you get `device_id` directly). Deliberately carries **no**
+`sensor_type` — that lives only in the sensor registry, looked up via the
+`sensor_id` here. This is what lets the resolution step tell two
+same-`sensor_type` instruments on one bus apart, since the sensor registry
+alone can't (see above).
 
-None of these three decoders can know what any channel *means* — that's
-entirely site config. Records from `decodeUC100`/`decodeUC300`/`decodeUC501`
-carry `ModbusChannel` or `IOChannel` instead of `SensorType`;
-`resolveChannelRecord` (main.go) looks up
-`deviceChannels[deviceID].Modbus[channel]` or `.IO[channel]`
-→ `sensor_id` → `sensors.json`'s `sensor_type`, filling both `SensorType` and
-`SensorID` before write. **A channel with no entry here is dropped** (logged),
-never written under an empty or made-up `sensor_type`.
+**No IO-channel equivalent exists yet.** The old `device_channels.json`
+also routed UC300/UC501's fixed-hardware GPIO/PT100/ADC/analog-input
+channels via an `io_channel` field; the registry API currently has no
+endpoint for that at all. `DeviceChannels.IO` in `main.go` is always an
+empty map as a result — every IO-channel reading from every UC300/UC501 is
+dropped today (logged, same "no entry, drop rather than invent a
+sensor_type" behavior as an unconfigured Modbus channel). This is a known
+gap, not a regression in practice: no currently-deployed device has ever
+had a real IO-channel entry (every real `device_channels.json` entry to
+date was Modbus-only).
 
-Loaded at startup and reloaded on the same `DEVICE_REGISTRY_REFRESH_SEC`
-interval. Non-fatal on a bad/missing file, same as `sensors.json`/`assets.json`.
+None of these three decoders can know what any Modbus channel *means* —
+that's entirely site config. Records from
+`decodeUC100`/`decodeUC300`/`decodeUC501` carry `ModbusChannel` or
+`IOChannel` instead of `SensorType`; `resolveChannelRecord` (main.go) looks
+up `deviceChannels[deviceID].Modbus[channel]` or `.IO[channel]` (always a
+miss for now)
+→ `sensor_id` → sensor registry's `sensor_type`, filling both `SensorType`
+and `SensorID` before write. **A channel with no entry here is dropped**
+(logged), never written under an empty or made-up `sensor_type`.
+
+Fetched at startup and re-fetched on the same `DEVICE_REGISTRY_REFRESH_SEC`
+interval. Non-fatal on a bad/unreachable fetch, same as the asset/sensor registries.
 
 ### Field reference
 
+Response shape from `GET .../modbus-channels`:
+
 | field             | type   | required                          | notes                                                  |
 | ------------------- | -------- | ------------------------------------ | ----------------------------------------------------------- |
-| `version`         | string | —                                  | top-level; log-only; bump when schema changes         |
-| `device_id`       | UUIDv7 | **mandatory**                      | FK → `devices.json`, must be `uc100`, `uc300`, or `uc501` |
-| `sensor_id`       | UUIDv7 | **mandatory**                      | FK → `sensors.json`                                    |
-| `modbus_channel`  | int    | required for a Modbus entry (1-32) | must be set together with `modbus_slave_id`            |
-| `modbus_slave_id` | int    | required for a Modbus entry        | documentation only — not read at decode time           |
-| `io_channel`      | int    | required for an IO entry           | UC300/UC501 only — UC100 has no fixed I/O hardware. On UC300, covers GPIO input/output, PT100, and ADC current/voltage alike (channel_id 3-14, one namespace on the wire); on UC501, covers GPIO (channel_id 3-4) and analog input (channel_id 5-6, alarm-report variant on 0x85/0x86 remapped to the same channel) — see the `uc100`/`uc300`/`uc501` sensor type reference section above for each device's exact channel meanings |
+| `id`              | UUID   | —                                  | this row's own identifier; not otherwise used by this repo |
+| `device_id`       | UUID   | **mandatory**                      | FK → device registry                                   |
+| `bus_type`        | string | —                                  | e.g. `"modbus_rs485"`; not currently read by this repo (available if useful later) |
+| `sensor_id`       | UUID   | **mandatory**                      | FK → sensor registry                                    |
+| `modbus_channel`  | int    | **mandatory** (1-32)               | must be non-zero, together with `modbus_slave_id`      |
+| `modbus_slave_id` | int    | **mandatory**                      | RS485 slave address; documentation only — not read at decode time |
 
-Each entry is **either** a Modbus channel (`modbus_channel` + `modbus_slave_id`)
-**or** an IO channel (`io_channel`) — never both, never neither.
-
-### Full example
+### Example response
 
 ```json
-{
-  "version": "1",
-  "channels": [
-    { "device_id": "01a03953-9387-7631-b960-5d7f9305a67c", "sensor_id": "01a03953-9387-76dd-bc9f-ee2b674fed66", "modbus_channel": 3, "modbus_slave_id": 2 },
-    { "device_id": "01a01fce-8746-7346-af7a-7db92b17cb72", "sensor_id": "01a03953-9387-76e9-b9dd-ce9662f2e172", "io_channel": 9 }
-  ]
-}
+[
+  {
+    "id": "f7f2e152-df25-499c-9ca5-c458bb8a8a37",
+    "device_id": "01a01fce-8746-7346-af7a-7282628432bd",
+    "bus_type": "modbus_rs485",
+    "sensor_id": "01a03fcc-98a9-734b-b7f8-68e5971e8410",
+    "modbus_channel": 1,
+    "modbus_slave_id": 1
+  }
+]
 ```
 
-**Validation rules (applied on every load):**
+**Validation rules (applied on every fetch):**
 
-- `device_id` and `sensor_id` must be valid UUIDv7
-- Exactly one of (`modbus_channel` + `modbus_slave_id`) or `io_channel` must be set
-- `io_channel` on a `device_id` known to be `device_model=uc100` is a **hard error** — UC100 has no fixed I/O hardware (this check only fires when the device is actually found; an unknown `device_id` is a soft FK like everywhere else)
-- Duplicate `sensor_id`, or duplicate `modbus_channel`/`io_channel` on the same device, causes the whole file to be rejected
+- `device_id`, `sensor_id`, `modbus_channel`, and `modbus_slave_id` must all be set (non-empty/non-zero)
+- Duplicate `sensor_id` across rows, or duplicate `modbus_channel` on the same device, causes the whole fetch to be rejected — mirrored by the registry API's own unique constraints
 
 ---
 
@@ -1007,8 +1089,8 @@ Each entry is **either** a Modbus channel (`modbus_channel` + `modbus_slave_id`)
 | `MQTT_BROKER`                 | _(required)_                   | e.g. `tcp://broker:1883`                           |
 | `INFLUXDB_HOST`               | `http://influxdb.maua.br:8181` | InfluxDB3 Core URL                                 |
 | `INFLUXDB_TOKEN`              | _(empty)_                      | Auth token (may be empty for unauthenticated Core) |
-| `DEVICE_REGISTRY_FILE`        | `devices.json`                 | Path to the JSON device registry                   |
-| `ASSET_REGISTRY_FILE`         | `assets.json`                  | Path to the JSON asset registry                    |
-| `SENSOR_REGISTRY_FILE`        | `sensors.json`                 | Path to the JSON sensor registry                    |
-| `DEVICE_CHANNEL_REGISTRY_FILE`| `device_channels.json`         | Path to the JSON UC100/UC300/UC501 channel registry  |
-| `DEVICE_REGISTRY_REFRESH_SEC` | `30`                            | Poll interval (seconds) for hot-reload of all four registries |
+| `REGISTRY_API_URL`            | `http://localhost:3333`        | Base URL of the SmartCampusMaua `api` repo's registry endpoints (devices/assets/sensors/modbus-channels) — plain unauthenticated `GET`, no token needed. Production points this at that API's in-cluster Kubernetes Service address. |
+| `DEVICE_REGISTRY_REFRESH_SEC` | `30`                            | Poll interval (seconds) for hot-reload of all four registry fetches |
+| `WRITE_WORKERS`               | `2 × GOMAXPROCS`                | Number of goroutines decoding/validating MQTT messages in parallel. Decode workers never call InfluxDB3 directly — see `WRITE_FLUSH_INTERVAL_SEC`/`WRITE_BATCH_SIZE` below. |
+| `WRITE_FLUSH_INTERVAL_SEC`    | `5`                             | How often the batch writer flushes buffered points to InfluxDB3, in seconds (or sooner, once `WRITE_BATCH_SIZE` is reached) |
+| `WRITE_BATCH_SIZE`            | `5000`                         | Point count that triggers an early flush before `WRITE_FLUSH_INTERVAL_SEC` elapses |

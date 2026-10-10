@@ -8,12 +8,15 @@ import (
 	"log"
 	"math"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	influxdb3 "github.com/InfluxCommunity/influxdb3-go/v2/influxdb3"
@@ -92,510 +95,374 @@ type DeviceConfig struct {
 	Model             DeviceModel
 	DeviceType        string // "LORAWAN" or "IP"
 	SerialNumber      string
-	MacAddress        string // IP/WiFi devices — written as mac_address InfluxDB3 tag
-	AssetID           string
-	AssetCoords       AssetCoords
+	MacAddress        string  // IP/WiFi devices — written as mac_address InfluxDB3 tag
+	AssetID           string  // this device's own/"home" asset — see SensorConfig.AssetID for the per-sensor override
 	BatteryVoltageMax float64 // V, full charge  (default 4.2 — LiPo/Li-Ion)
 	BatteryVoltageMin float64 // V, cutoff       (default 3.3 — LoRa safe minimum)
 	ProbeRangeM       float64 // DTL200: overrides bytes[3] when 0 (not configured via downlink)
 }
 
+// ─── Registry API client ───────────────────────────────────────────────────────
+//
+// devices/assets/sensors/modbus-channels are no longer this repo's own JSON
+// files — the SmartCampusMaua `api` repo's Postgres-backed registry owns
+// them now (the JSON files were a one-time bootstrap import, not the source
+// of truth). These four fetches replace four file reads; every route read
+// here is open (no auth token needed — this repo never writes).
+var registryHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+// fetchRegistryList performs one GET against the registry API and decodes a
+// JSON array response into T. Shared by all four fetchers below — a network
+// error, non-200 status, or unparseable body are all just "reload failed,"
+// handled by the caller exactly like a failed file read used to be.
+func fetchRegistryList[T any](url string) ([]T, error) {
+	resp, err := registryHTTPClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("request %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: unexpected status %s", url, resp.Status)
+	}
+	var out []T
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("%s: decode response: %w", url, err)
+	}
+	return out, nil
+}
+
 // ─── Device registry ─────────────────────────────────────────────────────────
 
-// DeviceEntry describes one device loaded from the external registry file.
-// If Allow is nil or true, the device is active; false disables ingestion.
-// Asset assignment (asset_id, asset_coords) lives in the separate asset
-// registry (assets.json), not here — see AssetEntry.
-type DeviceEntry struct {
-	Allow             *bool       `json:"allow,omitempty"`
-	DeviceID          string      `json:"device_id,omitempty"`
-	DeviceType        string      `json:"device_type,omitempty"` // "lorawan" or "ip"
-	SerialNumber      *string     `json:"serial_number"`         // required; warn if empty
-	DevEUI            string      `json:"dev_eui,omitempty"`     // mandatory for lorawan
-	MacAddress        string      `json:"mac_address,omitempty"` // mandatory for ip
-	DeviceModel       DeviceModel `json:"device_model,omitempty"`
-	BatteryVoltageMax float64     `json:"battery_voltage_max,omitempty"`
-	BatteryVoltageMin float64     `json:"battery_voltage_min,omitempty"`
-	ProbeRangeM       float64     `json:"probe_range_m,omitempty"`
+// apiDevice is the raw shape of one row from GET /api/registry/v0.1/devices.
+// Its own row identifier is "id" — unlike the old devices.json, where the
+// entity's identifier was named "device_id" after itself. Don't confuse this
+// with apiSensor.DeviceID/apiModbusChannel.DeviceID below, which are foreign
+// keys *to* a device and correctly keep that descriptive name.
+type apiDevice struct {
+	ID                string      `json:"id"`
+	DeviceModel       DeviceModel `json:"device_model"`
+	DeviceType        string      `json:"device_type"` // "lorawan" or "ip"
+	SerialNumber      string      `json:"serial_number"`
+	DevEUI            string      `json:"dev_eui"`
+	MacAddress        string      `json:"mac_address"`
+	BatteryVoltageMax float64     `json:"battery_voltage_max"`
+	BatteryVoltageMin float64     `json:"battery_voltage_min"`
+	ProbeRangeM       float64     `json:"probe_range_m"`
+	Allow             bool        `json:"allow"` // NOT NULL DEFAULT true on the API's side
+	AssetID           string      `json:"asset_id"`
 }
-
-// AssetCoords stores optional asset geolocation metadata.
-type AssetCoords struct {
-	Lng float64 `json:"lng,omitempty"`
-	Lat float64 `json:"lat,omitempty"`
-	Alt float64 `json:"alt,omitempty"`
-}
-
-type DeviceRegistryFile struct {
-	Version string        `json:"version,omitempty"`
-	Devices []DeviceEntry `json:"devices"`
-}
-
-// ─── Asset registry ───────────────────────────────────────────────────────────
-
-// AssetEntry describes one physical asset loaded from the external asset
-// registry file. DeviceIDs lists every device_id (from devices.json) mounted
-// on this asset — the cross-reference lives here, not on the device.
-type AssetEntry struct {
-	AssetID     string       `json:"asset_id,omitempty"`
-	AssetCoords *AssetCoords `json:"asset_coords,omitempty"`
-	DeviceIDs   []string     `json:"device_ids,omitempty"`
-}
-
-type AssetRegistryFile struct {
-	Version string       `json:"version,omitempty"`
-	Assets  []AssetEntry `json:"assets"`
-}
-
-// AssetConfig is the per-device projection of AssetEntry resolved by
-// GetAssetsMap: which asset a device is mounted on, and where that asset is.
-type AssetConfig struct {
-	AssetID     string
-	AssetCoords AssetCoords
-}
-
-// ─── Registry validation ──────────────────────────────────────────────────────
 
 var reDevEUI = regexp.MustCompile(`(?i)^[0-9a-f]{16}$`)
 
-func isUUIDv7(s string) bool {
-	id, err := uuid.Parse(s)
-	return err == nil && id.Version() == 7
+// isUUID reports whether s is a syntactically valid UUID of any version.
+// The registry API's own writes mint plain crypto.randomUUID() v4 ids (the
+// original bootstrap-imported rows are v7, from this repo's old UUIDv7
+// convention) — Postgres's own primary-key/FK constraints are the real
+// integrity guarantee now, so this only checks basic shape, not version.
+func isUUID(s string) bool {
+	_, err := uuid.Parse(s)
+	return err == nil
 }
 
-// validateEntry checks mandatory fields and format constraints for one device.
-// Returns an error for hard failures; logs warnings for soft issues.
-func validateEntry(e DeviceEntry) error {
-	if e.DeviceID == "" {
-		return fmt.Errorf("device_id is required")
+// validateAPIDevice checks mandatory fields and format constraints for one
+// device row. Returns an error for hard failures; logs warnings for soft issues.
+func validateAPIDevice(d apiDevice) error {
+	if d.ID == "" {
+		return fmt.Errorf("id is required")
 	}
-	if !isUUIDv7(e.DeviceID) {
-		return fmt.Errorf("device %s: device_id must be a valid UUIDv7", e.DeviceID)
+	if !isUUID(d.ID) {
+		return fmt.Errorf("device %s: id must be a valid UUID", d.ID)
 	}
-	if e.DeviceModel == "" {
-		return fmt.Errorf("device %s: device_model is required", e.DeviceID)
+	if d.DeviceModel == "" {
+		return fmt.Errorf("device %s: device_model is required", d.ID)
 	}
 
-	dt := strings.ToUpper(e.DeviceType)
+	dt := strings.ToUpper(d.DeviceType)
 	if dt != "LORAWAN" && dt != "IP" {
-		return fmt.Errorf("device %s: device_type must be \"lorawan\" or \"ip\", got %q", e.DeviceID, e.DeviceType)
+		return fmt.Errorf("device %s: device_type must be \"lorawan\" or \"ip\", got %q", d.ID, d.DeviceType)
 	}
 
 	if dt == "LORAWAN" {
-		if e.DevEUI == "" {
-			return fmt.Errorf("device %s: dev_eui is required for lorawan devices", e.DeviceID)
+		if d.DevEUI == "" {
+			return fmt.Errorf("device %s: dev_eui is required for lorawan devices", d.ID)
 		}
-		if !reDevEUI.MatchString(e.DevEUI) {
-			return fmt.Errorf("device %s: dev_eui %q must be 16 hex characters (EUI-64)", e.DeviceID, e.DevEUI)
+		if !reDevEUI.MatchString(d.DevEUI) {
+			return fmt.Errorf("device %s: dev_eui %q must be 16 hex characters (EUI-64)", d.ID, d.DevEUI)
 		}
 	}
 
 	if dt == "IP" {
-		if e.MacAddress == "" {
-			return fmt.Errorf("device %s: mac_address is required for ip devices", e.DeviceID)
+		if d.MacAddress == "" {
+			return fmt.Errorf("device %s: mac_address is required for ip devices", d.ID)
 		}
-		if _, err := net.ParseMAC(e.MacAddress); err != nil {
-			return fmt.Errorf("device %s: mac_address %q is invalid: %w", e.DeviceID, e.MacAddress, err)
+		if _, err := net.ParseMAC(d.MacAddress); err != nil {
+			return fmt.Errorf("device %s: mac_address %q is invalid: %w", d.ID, d.MacAddress, err)
 		}
 	}
 
-	if e.SerialNumber == nil {
-		return fmt.Errorf("device %s: serial_number field is required (use empty string if unknown)", e.DeviceID)
-	}
-	if *e.SerialNumber == "" {
-		log.Printf("[registry] warning: device %s (%s) has no serial_number", e.DeviceID, e.DeviceModel)
+	if d.SerialNumber == "" {
+		log.Printf("[registry] warning: device %s (%s) has no serial_number", d.ID, d.DeviceModel)
 	}
 
 	return nil
 }
 
-// GetDevicesMap loads the canonical device registry from a JSON file.
+// GetDevicesMap fetches the canonical device registry from the registry API.
 // Returns two maps:
 // - deviceID -> DeviceConfig
 // - devEUI   -> deviceID
-// All mandatory fields are validated; the whole file is rejected on any error.
-func GetDevicesMap(registryPath string) (map[string]DeviceConfig, map[string]string, error) {
-	contents, err := os.ReadFile(registryPath)
+// All mandatory fields are validated; the whole fetch is rejected on any error.
+func GetDevicesMap(apiBaseURL string) (map[string]DeviceConfig, map[string]string, error) {
+	rows, err := fetchRegistryList[apiDevice](apiBaseURL + "/api/registry/v0.1/devices")
 	if err != nil {
-		return nil, nil, fmt.Errorf("read registry file: %w", err)
+		return nil, nil, fmt.Errorf("fetch devices: %w", err)
 	}
+	log.Printf("[registry] devices=%d", len(rows))
 
-	var reg DeviceRegistryFile
-	if err := json.Unmarshal(contents, &reg); err != nil {
-		return nil, nil, fmt.Errorf("parse registry file: %w", err)
-	}
+	deviceMap := make(map[string]DeviceConfig, len(rows))
+	devEUIToDeviceID := make(map[string]string, len(rows))
 
-	if reg.Version == "" {
-		log.Printf("[registry] warning: devices.json has no version field")
-	} else {
-		log.Printf("[registry] version=%s devices=%d", reg.Version, len(reg.Devices))
-	}
-
-	deviceMap := make(map[string]DeviceConfig, len(reg.Devices))
-	devEUIToDeviceID := make(map[string]string, len(reg.Devices))
-
-	for i, entry := range reg.Devices {
-		if entry.Allow != nil && !*entry.Allow {
+	for _, d := range rows {
+		if !d.Allow {
 			continue
 		}
 
-		if err := validateEntry(entry); err != nil {
-			return nil, nil, fmt.Errorf("entry[%d]: %w", i, err)
+		if err := validateAPIDevice(d); err != nil {
+			return nil, nil, fmt.Errorf("%w", err)
 		}
 
-		deviceID := entry.DeviceID
-		deviceModel := entry.DeviceModel
-
-		if _, exists := deviceMap[deviceID]; exists {
-			return nil, nil, fmt.Errorf("duplicate device_id in registry: %s", deviceID)
+		if _, exists := deviceMap[d.ID]; exists {
+			return nil, nil, fmt.Errorf("duplicate device id in registry: %s", d.ID)
 		}
 
-		batteryMax := entry.BatteryVoltageMax
+		batteryMax := d.BatteryVoltageMax
 		if batteryMax == 0 {
 			batteryMax = 4.2
 		}
-		batteryMin := entry.BatteryVoltageMin
+		batteryMin := d.BatteryVoltageMin
 		if batteryMin == 0 {
 			batteryMin = 3.3
 		}
 
-		serialNumber := ""
-		if entry.SerialNumber != nil {
-			serialNumber = *entry.SerialNumber
-		}
-
-		deviceMap[deviceID] = DeviceConfig{
-			Model:             deviceModel,
-			DeviceType:        strings.ToUpper(entry.DeviceType),
-			SerialNumber:      serialNumber,
-			MacAddress:        strings.ToLower(entry.MacAddress),
+		deviceMap[d.ID] = DeviceConfig{
+			Model:             d.DeviceModel,
+			DeviceType:        strings.ToUpper(d.DeviceType),
+			SerialNumber:      d.SerialNumber,
+			MacAddress:        strings.ToLower(d.MacAddress),
+			AssetID:           d.AssetID,
 			BatteryVoltageMax: batteryMax,
 			BatteryVoltageMin: batteryMin,
-			ProbeRangeM:       entry.ProbeRangeM,
+			ProbeRangeM:       d.ProbeRangeM,
 		}
 
-		if entry.DevEUI != "" {
-			devEUINormalized := strings.ToLower(entry.DevEUI)
-			if mapped, exists := devEUIToDeviceID[devEUINormalized]; exists && mapped != deviceID {
-				return nil, nil, fmt.Errorf("duplicate dev_eui mapping for %s (%s and %s)", devEUINormalized, mapped, deviceID)
+		if d.DevEUI != "" {
+			devEUINormalized := strings.ToLower(d.DevEUI)
+			if mapped, exists := devEUIToDeviceID[devEUINormalized]; exists && mapped != d.ID {
+				return nil, nil, fmt.Errorf("duplicate dev_eui mapping for %s (%s and %s)", devEUINormalized, mapped, d.ID)
 			}
-			devEUIToDeviceID[devEUINormalized] = deviceID
+			devEUIToDeviceID[devEUINormalized] = d.ID
 		}
 	}
 
 	return deviceMap, devEUIToDeviceID, nil
 }
 
-// validateAssetEntry checks mandatory fields and format constraints for one
-// asset. Returns an error for hard failures; the caller decides how to log.
-func validateAssetEntry(a AssetEntry) error {
-	if a.AssetID == "" {
-		return fmt.Errorf("asset_id is required")
-	}
-	if !isUUIDv7(a.AssetID) {
-		return fmt.Errorf("asset %s: asset_id must be a valid UUIDv7", a.AssetID)
-	}
-	if a.AssetCoords != nil {
-		if a.AssetCoords.Lat < -90 || a.AssetCoords.Lat > 90 {
-			return fmt.Errorf("asset %s: asset_coords.lat %f out of range [-90, 90]", a.AssetID, a.AssetCoords.Lat)
-		}
-		if a.AssetCoords.Lng < -180 || a.AssetCoords.Lng > 180 {
-			return fmt.Errorf("asset %s: asset_coords.lng %f out of range [-180, 180]", a.AssetID, a.AssetCoords.Lng)
-		}
-	}
-	for _, deviceID := range a.DeviceIDs {
-		if !isUUIDv7(deviceID) {
-			return fmt.Errorf("asset %s: device_ids contains invalid UUIDv7 %q", a.AssetID, deviceID)
-		}
-	}
-	return nil
+// ─── Asset registry ───────────────────────────────────────────────────────────
+
+// apiAsset is the raw shape of one row from GET /api/registry/v0.1/assets.
+// asset_name/asset_slug/asset_coords/parent_asset_id are intentionally not
+// modeled here — this repo only ever needed an asset's id (for the asset_id
+// tag), never its metadata. Fetched purely to validate that devices/sensors
+// still reference an asset that actually exists — see validateAssetReferences.
+type apiAsset struct {
+	ID string `json:"id"`
 }
 
-// GetAssetsMap loads the physical asset registry from a JSON file and
-// resolves it into a deviceID -> AssetConfig lookup via each asset's
-// device_ids cross-reference. All mandatory fields are validated; the whole
-// file is rejected on any error.
-func GetAssetsMap(registryPath string) (map[string]AssetConfig, error) {
-	contents, err := os.ReadFile(registryPath)
+// GetAssetIDSet fetches every known asset id from the registry API, for
+// validateAssetReferences to check device/sensor asset_id values against.
+func GetAssetIDSet(apiBaseURL string) (map[string]bool, error) {
+	rows, err := fetchRegistryList[apiAsset](apiBaseURL + "/api/registry/v0.1/assets")
 	if err != nil {
-		return nil, fmt.Errorf("read asset registry file: %w", err)
+		return nil, fmt.Errorf("fetch assets: %w", err)
 	}
+	log.Printf("[registry] assets=%d", len(rows))
 
-	var reg AssetRegistryFile
-	if err := json.Unmarshal(contents, &reg); err != nil {
-		return nil, fmt.Errorf("parse asset registry file: %w", err)
+	out := make(map[string]bool, len(rows))
+	for _, a := range rows {
+		out[a.ID] = true
 	}
-
-	if reg.Version == "" {
-		log.Printf("[registry] warning: assets.json has no version field")
-	} else {
-		log.Printf("[registry] version=%s assets=%d", reg.Version, len(reg.Assets))
-	}
-
-	seenAssetID := make(map[string]bool, len(reg.Assets))
-	deviceToAsset := make(map[string]AssetConfig)
-
-	for i, a := range reg.Assets {
-		if err := validateAssetEntry(a); err != nil {
-			return nil, fmt.Errorf("entry[%d]: %w", i, err)
-		}
-		if seenAssetID[a.AssetID] {
-			return nil, fmt.Errorf("duplicate asset_id in registry: %s", a.AssetID)
-		}
-		seenAssetID[a.AssetID] = true
-
-		coords := AssetCoords{}
-		if a.AssetCoords != nil {
-			coords = *a.AssetCoords
-		}
-		cfg := AssetConfig{AssetID: a.AssetID, AssetCoords: coords}
-
-		for _, deviceID := range a.DeviceIDs {
-			if existing, exists := deviceToAsset[deviceID]; exists {
-				log.Printf("[registry] warning: device %s listed under multiple assets (%s and %s) — using %s",
-					deviceID, existing.AssetID, a.AssetID, a.AssetID)
-			}
-			deviceToAsset[deviceID] = cfg
-		}
-	}
-
-	return deviceToAsset, nil
+	return out, nil
 }
 
-// mergeAssetInfo backfills AssetID/AssetCoords onto each device from the
-// asset registry's device_ids cross-reference. Devices not listed under any
-// asset keep the zero value — asset assignment is optional.
-func mergeAssetInfo(deviceMap map[string]DeviceConfig, assetByDeviceID map[string]AssetConfig) {
+// validateAssetReferences logs a warning (never fails a reload) for every
+// device/sensor whose asset_id doesn't match a currently-known asset — same
+// lenient, soft-FK philosophy this file has always used for cross-entity
+// references that might just be a timing gap, not a real error.
+func validateAssetReferences(deviceMap map[string]DeviceConfig, sensorMap map[string]SensorConfig, validAssetIDs map[string]bool) {
 	for deviceID, cfg := range deviceMap {
-		if a, ok := assetByDeviceID[deviceID]; ok {
-			cfg.AssetID = a.AssetID
-			cfg.AssetCoords = a.AssetCoords
-			deviceMap[deviceID] = cfg
+		if cfg.AssetID != "" && !validAssetIDs[cfg.AssetID] {
+			log.Printf("[registry] warning: device %s references asset_id %s which does not exist", deviceID, cfg.AssetID)
+		}
+	}
+	for sensorID, s := range sensorMap {
+		if s.AssetID != "" && !validAssetIDs[s.AssetID] {
+			log.Printf("[registry] warning: sensor %s references asset_id %s which does not exist", sensorID, s.AssetID)
 		}
 	}
 }
 
 // ─── Sensor registry ──────────────────────────────────────────────────────────
 
-// SensorEntry describes one registered sensor loaded from the external sensor
-// registry file (sensors.json). sensor_type is the single source of truth for
-// what a sensor measures — device_channels.json references SensorID but never
-// repeats SensorType, so there is exactly one place to look it up.
-type SensorEntry struct {
-	SensorID   string `json:"sensor_id,omitempty"`
-	SensorType string `json:"sensor_type,omitempty"`
-	DeviceID   string `json:"device_id,omitempty"` // FK -> devices.json; who currently reports this sensor
-	// DeviceIndex disambiguates multiple sensors sharing (device_id,
-	// sensor_type) on one device (e.g. three soil-moisture probes at
-	// different depths) — matches record.SensorDataRecord.DeviceIndex. Zero
-	// for single-instance sensors. Never written to InfluxDB3.
-	DeviceIndex int `json:"device_index,omitempty"`
-	// SensorName is a purely cosmetic human label (e.g. "Depth 10cm") — never
-	// used for resolution, never written to InfluxDB3.
-	SensorName string `json:"sensor_name,omitempty"`
+// apiSensor is the raw shape of one row from GET /api/registry/v0.1/sensors.
+// Its own row identifier is "id" (see apiDevice's doc comment on this naming
+// trap); DeviceID here is a genuine foreign key to a device, unchanged.
+type apiSensor struct {
+	ID          string `json:"id"`
+	SensorType  string `json:"sensor_type"`
+	DeviceID    string `json:"device_id"`
+	DeviceIndex int    `json:"device_index"`
+	SensorName  string `json:"sensor_name"`
+	// AssetID is an override, independent of the sensor's device's own
+	// asset_id — set only for a sensor on a bus-listening device (e.g. a
+	// UC300) that's physically relaying readings for a different asset than
+	// wherever the device itself sits. Effective asset for a sensor is
+	// sensor.AssetID if set, else the device's own AssetID — see the
+	// resolution step in parseDeviceModel.
+	AssetID string `json:"asset_id"`
 }
 
-type SensorRegistryFile struct {
-	Version string        `json:"version,omitempty"`
-	Sensors []SensorEntry `json:"sensors"`
-}
-
-// SensorConfig is the resolved projection of one SensorEntry, keyed by
+// SensorConfig is the resolved projection of one apiSensor, keyed by
 // sensor_id in the map GetSensorsMap returns.
 type SensorConfig struct {
 	SensorType  string
 	DeviceID    string
 	DeviceIndex int
 	SensorName  string
+	AssetID     string // override — see apiSensor.AssetID
 }
 
-// validateSensorEntry checks mandatory fields and format constraints for one
-// sensor. validTypes is record.AllSensorTypes(), computed once by the caller
-// rather than per-entry. Returns an error for hard failures.
-func validateSensorEntry(s SensorEntry, validTypes map[string]bool) error {
-	if s.SensorID == "" {
-		return fmt.Errorf("sensor_id is required")
+// validateAPISensor checks mandatory fields and format constraints for one
+// sensor row. validTypes is record.AllSensorTypes(), computed once by the
+// caller rather than per-entry. Returns an error for hard failures.
+func validateAPISensor(s apiSensor, validTypes map[string]bool) error {
+	if s.ID == "" {
+		return fmt.Errorf("id is required")
 	}
-	if !isUUIDv7(s.SensorID) {
-		return fmt.Errorf("sensor %s: sensor_id must be a valid UUIDv7", s.SensorID)
+	if !isUUID(s.ID) {
+		return fmt.Errorf("sensor %s: id must be a valid UUID", s.ID)
 	}
 	if s.SensorType == "" {
-		return fmt.Errorf("sensor %s: sensor_type is required", s.SensorID)
+		return fmt.Errorf("sensor %s: sensor_type is required", s.ID)
 	}
 	if !validTypes[s.SensorType] {
-		return fmt.Errorf("sensor %s: sensor_type %q is not a recognized sensor_type (see record.SensorTypes) — add it there first if it's genuinely new", s.SensorID, s.SensorType)
+		return fmt.Errorf("sensor %s: sensor_type %q is not a recognized sensor_type (see record.SensorTypes) — add it there first if it's genuinely new", s.ID, s.SensorType)
 	}
 	if s.DeviceID == "" {
-		return fmt.Errorf("sensor %s: device_id is required", s.SensorID)
+		return fmt.Errorf("sensor %s: device_id is required", s.ID)
 	}
-	if !isUUIDv7(s.DeviceID) {
-		return fmt.Errorf("sensor %s: device_id must be a valid UUIDv7", s.SensorID)
+	if !isUUID(s.DeviceID) {
+		return fmt.Errorf("sensor %s: device_id must be a valid UUID", s.ID)
 	}
 	if s.DeviceIndex < 0 {
-		return fmt.Errorf("sensor %s: device_index must not be negative", s.SensorID)
+		return fmt.Errorf("sensor %s: device_index must not be negative", s.ID)
 	}
 	return nil
 }
 
-// GetSensorsMap loads the canonical sensor registry from a JSON file.
+// GetSensorsMap fetches the canonical sensor registry from the registry API.
 // Returns sensorID -> SensorConfig. All mandatory fields are validated; the
-// whole file is rejected on any error. Cross-file references (device_id
-// existing in devices.json) are deliberately NOT checked here — same
-// decoupling as GetAssetsMap: an entry pointing at a device_id that doesn't
-// (yet) exist just never resolves to anything at decode time, rather than
-// failing the whole file. Not unique on (device_id, sensor_type) alone — two
+// whole fetch is rejected on any error. Cross-entity references (device_id
+// existing in the device registry) are deliberately NOT checked here — same
+// decoupling as before: a row pointing at a device_id that doesn't (yet)
+// exist just never resolves to anything at decode time, rather than failing
+// the whole fetch. Not unique on (device_id, sensor_type) alone — two
 // sensors of the same type can legitimately share a device (e.g. three
 // soil-moisture probes at different depths); device_index disambiguates
 // them, and (device_id, sensor_type, device_index) together must be unique.
-func GetSensorsMap(registryPath string) (map[string]SensorConfig, error) {
-	contents, err := os.ReadFile(registryPath)
+func GetSensorsMap(apiBaseURL string) (map[string]SensorConfig, error) {
+	rows, err := fetchRegistryList[apiSensor](apiBaseURL + "/api/registry/v0.1/sensors")
 	if err != nil {
-		return nil, fmt.Errorf("read sensor registry file: %w", err)
+		return nil, fmt.Errorf("fetch sensors: %w", err)
 	}
-
-	var reg SensorRegistryFile
-	if err := json.Unmarshal(contents, &reg); err != nil {
-		return nil, fmt.Errorf("parse sensor registry file: %w", err)
-	}
-
-	if reg.Version == "" {
-		log.Printf("[registry] warning: sensors.json has no version field")
-	} else {
-		log.Printf("[registry] version=%s sensors=%d", reg.Version, len(reg.Sensors))
-	}
+	log.Printf("[registry] sensors=%d", len(rows))
 
 	validTypes := record.AllSensorTypes()
-	sensorMap := make(map[string]SensorConfig, len(reg.Sensors))
-	seenTuple := make(map[string]string, len(reg.Sensors)) // (device_id,sensor_type,device_index) -> sensor_id
+	sensorMap := make(map[string]SensorConfig, len(rows))
+	seenTuple := make(map[string]string, len(rows)) // (device_id,sensor_type,device_index) -> sensor_id
 
-	for i, s := range reg.Sensors {
-		if err := validateSensorEntry(s, validTypes); err != nil {
-			return nil, fmt.Errorf("entry[%d]: %w", i, err)
+	for _, s := range rows {
+		if err := validateAPISensor(s, validTypes); err != nil {
+			return nil, fmt.Errorf("%w", err)
 		}
-		if _, exists := sensorMap[s.SensorID]; exists {
-			return nil, fmt.Errorf("duplicate sensor_id in registry: %s", s.SensorID)
+		if _, exists := sensorMap[s.ID]; exists {
+			return nil, fmt.Errorf("duplicate sensor id in registry: %s", s.ID)
 		}
 		tupleKey := sensorIndexKey(s.DeviceID, s.SensorType, s.DeviceIndex)
 		if existing, exists := seenTuple[tupleKey]; exists {
-			return nil, fmt.Errorf("entry[%d]: device_id/sensor_type/device_index already assigned to sensor %s: %s", i, existing, tupleKey)
+			return nil, fmt.Errorf("device_id/sensor_type/device_index already assigned to sensor %s: %s", existing, tupleKey)
 		}
-		seenTuple[tupleKey] = s.SensorID
-		sensorMap[s.SensorID] = SensorConfig{
+		seenTuple[tupleKey] = s.ID
+		sensorMap[s.ID] = SensorConfig{
 			SensorType: s.SensorType, DeviceID: s.DeviceID, DeviceIndex: s.DeviceIndex,
-			SensorName: s.SensorName,
+			SensorName: s.SensorName, AssetID: s.AssetID,
 		}
 	}
 
 	return sensorMap, nil
 }
 
-// ─── Device channel registry (UC100/UC300 RS485 routing) ─────────────────────
+// ─── Modbus channel registry (UC100/UC300 RS485 routing) ─────────────────────
 
-// DeviceChannelEntry describes one wire-level channel routing binding for a
-// UC-series device: which sensor_id a specific Modbus channel or GPIO number
-// currently represents. Exactly one of (ModbusChannel+ModbusSlaveID) or
-// GPIONumber must be set — never both, never neither. Never carries
-// sensor_type — that lives exclusively in sensors.json (see SensorEntry).
-type DeviceChannelEntry struct {
-	DeviceID      string `json:"device_id,omitempty"`
-	SensorID      string `json:"sensor_id,omitempty"`
-	ModbusChannel int    `json:"modbus_channel,omitempty"`  // 1-32; protocol never uses 0
-	ModbusSlaveID int    `json:"modbus_slave_id,omitempty"` // RS485 slave address; documentation only, not used at decode time
-	// IOChannel is UC300's raw fixed-hardware channel_id byte (3-14),
-	// covering GPIO input/output, PT100, and ADC current/voltage alike —
-	// they share one channel_id namespace on the wire, so one field covers
-	// all of them. UC100 has none of this hardware. Protocol never uses 0.
-	IOChannel int `json:"io_channel,omitempty"`
+// apiModbusChannel is the raw shape of one row from GET
+// /api/registry/v0.1/modbus-channels — already flattened/joined server-side
+// (the underlying device->bus->channel table structure isn't exposed here).
+// There is currently no equivalent endpoint for UC300's fixed-hardware IO
+// channels (GPIO/PT100/ADC) — see DeviceChannels.IO's doc comment.
+type apiModbusChannel struct {
+	ID            string `json:"id"`
+	DeviceID      string `json:"device_id"`
+	BusType       string `json:"bus_type"`
+	SensorID      string `json:"sensor_id"`
+	ModbusChannel int    `json:"modbus_channel"` // 1-32; protocol never uses 0
+	ModbusSlaveID int    `json:"modbus_slave_id"`
 }
 
-type DeviceChannelRegistryFile struct {
-	Version  string               `json:"version,omitempty"`
-	Channels []DeviceChannelEntry `json:"channels"`
-}
-
-// DeviceChannels holds one UC-series device's channel->sensor_id routing,
-// split by channel kind since Modbus and IO channel numbers are independent
-// namespaces (modbus_channel=3 and io_channel=3 are unrelated channels).
+// DeviceChannels holds one UC-series device's channel->sensor_id routing.
 type DeviceChannels struct {
 	Modbus map[int]string // modbus_channel -> sensor_id
-	IO     map[int]string // io_channel -> sensor_id
+	// IO would be io_channel -> sensor_id (UC300's fixed-hardware GPIO/PT100/
+	// ADC pins), but the registry API has no io-channels endpoint yet —
+	// always empty until one exists. No currently-deployed device relies on
+	// this (every real device_channels.json entry to date has been Modbus
+	// only), so this is a known gap, not a regression in practice today.
+	IO map[int]string
 }
 
-// validateDeviceChannelEntry checks mandatory fields, format, and the
-// modbus-xor-io shape for one entry. deviceMap is used only to enforce that
-// a uc100 device never carries an IO entry (uc100 has no fixed-hardware
-// GPIO/PT100/ADC channels); when e.DeviceID isn't found in deviceMap that
-// check is simply skipped — same "not yet resolvable" leniency as elsewhere
-// in this file, not a validation failure.
-func validateDeviceChannelEntry(e DeviceChannelEntry, deviceMap map[string]DeviceConfig) error {
-	if e.DeviceID == "" {
-		return fmt.Errorf("device_id is required")
-	}
-	if !isUUIDv7(e.DeviceID) {
-		return fmt.Errorf("device_id %q must be a valid UUIDv7", e.DeviceID)
-	}
-	if e.SensorID == "" {
-		return fmt.Errorf("device %s: sensor_id is required", e.DeviceID)
-	}
-	if !isUUIDv7(e.SensorID) {
-		return fmt.Errorf("device %s: sensor_id %q must be a valid UUIDv7", e.DeviceID, e.SensorID)
-	}
-
-	isModbus := e.ModbusChannel != 0 || e.ModbusSlaveID != 0
-	isIO := e.IOChannel != 0
-
-	switch {
-	case isModbus && isIO:
-		return fmt.Errorf("device %s sensor %s: entry cannot be both a Modbus and an IO channel", e.DeviceID, e.SensorID)
-	case !isModbus && !isIO:
-		return fmt.Errorf("device %s sensor %s: entry must set either modbus_channel+modbus_slave_id or io_channel", e.DeviceID, e.SensorID)
-	case isModbus && (e.ModbusChannel == 0 || e.ModbusSlaveID == 0):
-		return fmt.Errorf("device %s sensor %s: modbus_channel and modbus_slave_id must both be set together", e.DeviceID, e.SensorID)
-	}
-
-	if isIO {
-		if cfg, ok := deviceMap[e.DeviceID]; ok && strings.EqualFold(string(cfg.Model), string(UC100)) {
-			return fmt.Errorf("device %s sensor %s: device_model uc100 has no fixed I/O hardware, but an io_channel entry was given", e.DeviceID, e.SensorID)
-		}
-	}
-
-	return nil
-}
-
-// GetDeviceChannelsMap loads the UC-series channel routing registry from a
-// JSON file. Returns deviceID -> DeviceChannels. Routing only — never
-// carries sensor_type. device_id/sensor_id existence in devices.json/
-// sensors.json is deliberately not checked here, same decoupling as
-// GetAssetsMap/GetSensorsMap — an entry referencing something that doesn't
-// exist yet just never resolves to a tag at decode time. A channel number
-// (Modbus or IO) reused across two entries on the same device IS a hard
-// error, since that's a real, structural misconfiguration, not a timing gap.
-func GetDeviceChannelsMap(registryPath string, deviceMap map[string]DeviceConfig) (map[string]DeviceChannels, error) {
-	contents, err := os.ReadFile(registryPath)
+// GetDeviceChannelsMap fetches the Modbus channel routing registry from the
+// registry API. Returns deviceID -> DeviceChannels. Routing only — never
+// carries sensor_type. device_id/sensor_id existence in the device/sensor
+// registries is deliberately not checked here, same decoupling as
+// GetAssetIDSet/GetSensorsMap — a row referencing something that doesn't
+// exist yet just never resolves to a tag at decode time. A channel/slave
+// combination reused across two rows on the same device IS a hard error
+// (mirrored by the API's own unique constraint), since that's a real,
+// structural misconfiguration, not a timing gap.
+func GetDeviceChannelsMap(apiBaseURL string) (map[string]DeviceChannels, error) {
+	rows, err := fetchRegistryList[apiModbusChannel](apiBaseURL + "/api/registry/v0.1/modbus-channels")
 	if err != nil {
-		return nil, fmt.Errorf("read device channel registry file: %w", err)
+		return nil, fmt.Errorf("fetch modbus-channels: %w", err)
 	}
-
-	var reg DeviceChannelRegistryFile
-	if err := json.Unmarshal(contents, &reg); err != nil {
-		return nil, fmt.Errorf("parse device channel registry file: %w", err)
-	}
-
-	if reg.Version == "" {
-		log.Printf("[registry] warning: device_channels.json has no version field")
-	} else {
-		log.Printf("[registry] version=%s channels=%d", reg.Version, len(reg.Channels))
-	}
+	log.Printf("[registry] modbus_channels=%d", len(rows))
 
 	out := make(map[string]DeviceChannels)
-	seenSensorID := make(map[string]bool, len(reg.Channels))
+	seenSensorID := make(map[string]bool, len(rows))
 
-	for i, e := range reg.Channels {
-		if err := validateDeviceChannelEntry(e, deviceMap); err != nil {
-			return nil, fmt.Errorf("entry[%d]: %w", i, err)
+	for _, e := range rows {
+		if e.DeviceID == "" || e.SensorID == "" || e.ModbusChannel == 0 || e.ModbusSlaveID == 0 {
+			return nil, fmt.Errorf("modbus channel %s: device_id/sensor_id/modbus_channel/modbus_slave_id must all be set", e.ID)
 		}
 		if seenSensorID[e.SensorID] {
-			return nil, fmt.Errorf("entry[%d]: duplicate sensor_id in device channel registry: %s", i, e.SensorID)
+			return nil, fmt.Errorf("duplicate sensor_id in modbus channel registry: %s", e.SensorID)
 		}
 		seenSensorID[e.SensorID] = true
 
@@ -603,17 +470,10 @@ func GetDeviceChannelsMap(registryPath string, deviceMap map[string]DeviceConfig
 		if !ok {
 			dc = DeviceChannels{Modbus: make(map[int]string), IO: make(map[int]string)}
 		}
-		if e.ModbusChannel != 0 {
-			if existing, exists := dc.Modbus[e.ModbusChannel]; exists {
-				return nil, fmt.Errorf("entry[%d]: device %s: modbus_channel %d already assigned to sensor %s", i, e.DeviceID, e.ModbusChannel, existing)
-			}
-			dc.Modbus[e.ModbusChannel] = e.SensorID
-		} else {
-			if existing, exists := dc.IO[e.IOChannel]; exists {
-				return nil, fmt.Errorf("entry[%d]: device %s: io_channel %d already assigned to sensor %s", i, e.DeviceID, e.IOChannel, existing)
-			}
-			dc.IO[e.IOChannel] = e.SensorID
+		if existing, exists := dc.Modbus[e.ModbusChannel]; exists {
+			return nil, fmt.Errorf("device %s: modbus_channel %d already assigned to sensor %s", e.DeviceID, e.ModbusChannel, existing)
 		}
+		dc.Modbus[e.ModbusChannel] = e.SensorID
 		out[e.DeviceID] = dc
 	}
 
@@ -743,7 +603,11 @@ func validateRecord(r record.SensorDataRecord) error {
 	return nil
 }
 
-func writeSensorRecords(ctx context.Context, iot *influxdb3.Client, records []record.SensorDataRecord) error {
+// buildSensorPoints converts decoded records into valid InfluxDB3 points,
+// dropping (and logging) any record that fails validation. Pure — no I/O.
+// The actual write happens later, fanned into a single batchWriter (see its
+// doc comment below) instead of one WritePoints call per message here.
+func buildSensorPoints(records []record.SensorDataRecord) []*influxdb3.Point {
 	if len(records) == 0 {
 		return nil
 	}
@@ -789,41 +653,21 @@ func writeSensorRecords(ctx context.Context, iot *influxdb3.Client, records []re
 			points = append(points, p)
 		}
 	}
-	if len(points) == 0 {
-		return nil
-	}
-	// NoSync avoids WAL-lock conflicts on InfluxDB3 Core under concurrent writes.
-	// For IoT sensor data losing a point on a hard crash is acceptable.
-	const maxAttempts = 3
-	batchErr := writeWithRetry(ctx, iot, points, maxAttempts)
-	if batchErr == nil {
-		return nil
-	}
-	// Batch failed — fall back to per-point writes so one bad record does not
-	// silently drop all other sensor readings from the same message.
-	logWarn("batch of %d points failed (%v) – retrying individually", len(points), batchErr)
-	var dropped int
-	for i, pt := range points {
-		if err := writeWithRetry(ctx, iot, []*influxdb3.Point{pt}, maxAttempts); err != nil {
-			// Include the tag values so the bad point is identifiable in logs.
-			devID, _ := pt.GetTag("device_id")
-			sensorType, _ := pt.GetTag("sensor_type")
-			logError("point %d/%d dropped permanently: device_id=%s sensor_type=%s error=%v",
-				i+1, len(points), devID, sensorType, err)
-			dropped++
-		}
-	}
-	if dropped > 0 {
-		logError("%d/%d points dropped for this message", dropped, len(points))
-		return fmt.Errorf("%d points failed to write", dropped)
-	}
-	return nil
+	return points
+}
+
+// influxWriter is the subset of *influxdb3.Client this file depends on,
+// narrowed to an interface purely so tests can substitute a fake instead of
+// making a real HTTP call. *influxdb3.Client satisfies this as-is — nothing
+// about production behavior changes.
+type influxWriter interface {
+	WritePoints(ctx context.Context, points []*influxdb3.Point, options ...influxdb3.WriteOption) error
 }
 
 // writeWithRetry attempts to write points up to maxAttempts times with
 // exponential back-off. Unrecoverable 4xx errors (except 429) are returned
 // immediately without retrying.
-func writeWithRetry(ctx context.Context, iot *influxdb3.Client, points []*influxdb3.Point, maxAttempts int) error {
+func writeWithRetry(ctx context.Context, iot influxWriter, points []*influxdb3.Point, maxAttempts int) error {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		err := iot.WritePoints(ctx, points, influxdb3.WithNoSync(true))
 		if err == nil {
@@ -892,13 +736,155 @@ func extractHTTPStatus(errStr string) string {
 	return "4xx"
 }
 
-// writeAuditLog writes every raw MQTT/LoRaWAN payload to the audit_iot database.
+// ─────────────────────────────────────────────────────────────────────────────
+// Batch writer — fans in points from many concurrent decode workers into one
+// InfluxDB3 client
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Previously, every worker goroutine called WritePoints directly, once per
+// MQTT message — with WRITE_WORKERS (default 2×GOMAXPROCS, 8+ on a typical
+// host) all doing this independently and concurrently, every device uplink
+// became its own tiny, uncoordinated write request. Direct inspection of the
+// on-disk Parquet files showed this fragmenting into 2-4 separate files per
+// 10-minute window instead of one — confirmed by disjoint sensor sets across
+// those files (the signature of multiple independent write streams landing
+// in the same window, not one writer flushing once). That multiplies the
+// effective file count InfluxDB3 has to scan for any time-range query,
+// eventually exceeding its file-scan cap even for ranges well inside the
+// nominal safe window.
+//
+// batchWriter fixes this by making exactly one goroutine responsible for
+// ever calling WritePoints against a given InfluxDB3 client. Decode workers
+// keep running fully in parallel — they just hand their finished points to
+// this writer over a channel instead of writing them directly — and the
+// writer accumulates into a buffer, flushing on a timer or once the buffer
+// hits a size threshold, whichever comes first. One writer, one flush at a
+// time, one InfluxDB3 write stream per client — no more concurrent
+// uncoordinated writers to fragment across.
+type batchWriter struct {
+	client   influxWriter
+	name     string // for logging, e.g. "sensor_data" / "raw"
+	batches  chan []*influxdb3.Point
+	interval time.Duration
+	maxBatch int
+	wg       sync.WaitGroup
+}
+
+// writeBatchChanCapacity is how many message-batches (not points — each
+// Enqueue call pushes one message's worth of points as a single slice) the
+// writer's input channel can hold before Enqueue starts blocking the calling
+// decode worker. Generously sized so a slow flush doesn't stall decoding;
+// not exposed as an env var since WRITE_FLUSH_INTERVAL_SEC/WRITE_BATCH_SIZE
+// are the actual tuning knobs — this just needs to be "big enough."
+const writeBatchChanCapacity = 4096
+
+// newBatchWriter starts the writer's background flush loop and returns
+// immediately; call Close to flush whatever's buffered and stop it.
+func newBatchWriter(client influxWriter, name string, interval time.Duration, maxBatch int) *batchWriter {
+	bw := &batchWriter{
+		client:   client,
+		name:     name,
+		batches:  make(chan []*influxdb3.Point, writeBatchChanCapacity),
+		interval: interval,
+		maxBatch: maxBatch,
+	}
+	bw.wg.Add(1)
+	go bw.run()
+	return bw
+}
+
+// Enqueue hands one message's worth of points to the writer. Non-blocking in
+// practice (buffered channel); only blocks the caller if the writer has
+// fallen far enough behind to fill writeBatchChanCapacity, which is the
+// intended backpressure signal if flush interval/batch size ever need retuning.
+func (bw *batchWriter) Enqueue(points []*influxdb3.Point) {
+	if len(points) == 0 {
+		return
+	}
+	bw.batches <- points
+}
+
+// Close does not itself stop new work from arriving — callers must stop
+// calling Enqueue first (e.g. by draining/closing whatever feeds them).
+// Close closes the input channel and blocks until run has flushed
+// everything already buffered and exited — the graceful-shutdown guarantee
+// that no enqueued points are silently lost on a clean shutdown.
+func (bw *batchWriter) Close() {
+	close(bw.batches)
+	bw.wg.Wait()
+}
+
+func (bw *batchWriter) run() {
+	defer bw.wg.Done()
+	ticker := time.NewTicker(bw.interval)
+	defer ticker.Stop()
+	ctx := context.Background()
+	buf := make([]*influxdb3.Point, 0, bw.maxBatch)
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		bw.writeBatch(ctx, buf)
+		buf = make([]*influxdb3.Point, 0, bw.maxBatch)
+	}
+
+	for {
+		select {
+		case batch, ok := <-bw.batches:
+			if !ok {
+				flush() // final flush on shutdown — see Close
+				return
+			}
+			buf = append(buf, batch...)
+			if len(buf) >= bw.maxBatch {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// writeBatch writes one consolidated batch, retrying the batch as a whole
+// first; if that still fails, falls back to per-point writes so one bad
+// point doesn't drop the entire flush interval's data — the same resilience
+// shape this file has always used, just applied to the larger consolidated
+// batch instead of one message's points.
+func (bw *batchWriter) writeBatch(ctx context.Context, points []*influxdb3.Point) {
+	const maxAttempts = 3
+	batchErr := writeWithRetry(ctx, bw.client, points, maxAttempts)
+	if batchErr == nil {
+		log.Printf("[influxdb3] wrote %d points to %s", len(points), bw.name)
+		return
+	}
+	// Batch failed — fall back to per-point writes so one bad point does not
+	// silently drop the whole flush interval's data.
+	logWarn("%s: batch of %d points failed (%v) – retrying individually", bw.name, len(points), batchErr)
+
+	var dropped int
+	for i, pt := range points {
+		if err := writeWithRetry(ctx, bw.client, []*influxdb3.Point{pt}, maxAttempts); err != nil {
+			// Include the tag values so the bad point is identifiable in logs.
+			devID, _ := pt.GetTag("device_id")
+			sensorType, _ := pt.GetTag("sensor_type")
+			logError("%s: point %d/%d dropped permanently: device_id=%s sensor_type=%s error=%v",
+				bw.name, i+1, len(points), devID, sensorType, err)
+			dropped++
+		}
+	}
+	if dropped > 0 {
+		logError("%s: %d/%d points dropped from this flush", bw.name, dropped, len(points))
+	}
+}
+
+// buildAuditPoint builds (but does not write) one raw-payload audit point.
 //
 // Schema (measurement = "raw"):
 //
 //	Tags:  device_id                   — identifies the physical device
 //	       asset_id                    — whichever asset the device was assigned to at
-//	                                      this instant (see assets.json); omitted when unassigned
+//	                                      this instant (see the registry API); omitted when unassigned
 //	       event_type = "payload_ingest" — fixed; low-cardinality; extensible
 //	Field: raw_data  (string ≤512 chars) — original undecoded message
 //	Time:  ingestion timestamp (time.Now() at message receipt)
@@ -910,7 +896,7 @@ func extractHTTPStatus(errStr string) string {
 //
 // The audit database carries a short retention policy set on the InfluxDB3 server
 // (e.g., 7–30 days) independently of the sensor_data database.
-func writeAuditLog(ctx context.Context, audit *influxdb3.Client, deviceID, assetID, rawData string, ts time.Time) {
+func buildAuditPoint(deviceID, assetID, rawData string, ts time.Time) *influxdb3.Point {
 	const maxLen = 512
 	if len(rawData) > maxLen {
 		rawData = rawData[:maxLen] + "…"
@@ -923,9 +909,14 @@ func writeAuditLog(ctx context.Context, audit *influxdb3.Client, deviceID, asset
 	if assetID != "" {
 		p = p.SetTag("asset_id", assetID)
 	}
-	if err := writeWithRetry(ctx, audit, []*influxdb3.Point{p}, 3); err != nil {
-		logWarn("audit write failed for device_id=%s: %v", deviceID, err)
-	}
+	return p
+}
+
+// writeAuditLog hands one raw-payload audit point to auditWriter — see
+// batchWriter's doc comment for why this is no longer a direct WritePoints
+// call per message.
+func writeAuditLog(auditWriter *batchWriter, deviceID, assetID, rawData string, ts time.Time) {
+	auditWriter.Enqueue([]*influxdb3.Point{buildAuditPoint(deviceID, assetID, rawData, ts)})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -970,11 +961,26 @@ func resolveChannelRecord(r *record.SensorDataRecord, deviceID string, channel i
 	return true
 }
 
+// effectiveAssetID resolves which asset a record should be tagged with: the
+// sensor's own asset_id override if it has one, else the device's own home
+// asset (deviceAssetID). This is the fix for a bus-listening device (e.g. a
+// UC300) that's physically mounted on one asset while relaying sensor
+// readings that actually belong to a *different* asset reachable on the
+// same bus — see apiSensor.AssetID's doc comment for the full rationale.
+// Computing this from the device alone (ignoring the sensor's own override)
+// would silently misattribute every such sensor's data to the wrong asset.
+func effectiveAssetID(deviceAssetID string, sensor SensorConfig) string {
+	if sensor.AssetID != "" {
+		return sensor.AssetID
+	}
+	return deviceAssetID
+}
+
 // parseDeviceModel decodes rawPayload and writes sensor_data points to InfluxDB3.
 //
 // provider == "custom": rawPayload is raw JSON; timestamp comes from the message.
 // LNS providers:        rawPayload is base64-encoded binary; timestamp from LNS frame.
-func parseDeviceModel(ctx context.Context, iot *influxdb3.Client,
+func parseDeviceModel(sensorWriter *batchWriter,
 	deviceID, devEUI string, config DeviceConfig, provider, rawPayload string, port uint64, ts time.Time,
 	reg registrySnapshot) {
 
@@ -1033,6 +1039,11 @@ func parseDeviceModel(ctx context.Context, iot *influxdb3.Client,
 				r.SensorID = sensorID
 			}
 		}
+		// Only applies once SensorID is actually resolved; an unresolved
+		// reading keeps the device-level default already set on r.AssetID above.
+		if r.SensorID != "" {
+			r.AssetID = effectiveAssetID(r.AssetID, reg.SensorMap[r.SensorID])
+		}
 		resolved = append(resolved, r)
 	}
 	records = resolved
@@ -1040,16 +1051,18 @@ func parseDeviceModel(ctx context.Context, iot *influxdb3.Client,
 		log.Printf("[parse] all records dropped after sensor resolution for %s (%s)", deviceID, deviceModel)
 		return
 	}
-	if err := writeSensorRecords(ctx, iot, records); err != nil {
-		logError("sensor write failed for device_id=%s model=%s: %v", deviceID, deviceModel, err)
+	points := buildSensorPoints(records)
+	if len(points) == 0 {
+		log.Printf("[parse] no valid points after building for %s (%s)", deviceID, deviceModel)
+		return
+	}
+	sensorWriter.Enqueue(points)
+	if devEUI != "" {
+		log.Printf("[influxdb3] queued %d points: device_model=%s device_id=%s dev_eui=%s",
+			len(points), strings.ToLower(string(deviceModel)), deviceID, devEUI)
 	} else {
-		if devEUI != "" {
-			log.Printf("[influxdb3] wrote %d points: device_model=%s device_id=%s dev_eui=%s",
-				len(records), strings.ToLower(string(deviceModel)), deviceID, devEUI)
-		} else {
-			log.Printf("[influxdb3] wrote %d points: device_model=%s device_id=%s",
-				len(records), strings.ToLower(string(deviceModel)), deviceID)
-		}
+		log.Printf("[influxdb3] queued %d points: device_model=%s device_id=%s",
+			len(points), strings.ToLower(string(deviceModel)), deviceID)
 	}
 }
 
@@ -1058,7 +1071,7 @@ func parseDeviceModel(ctx context.Context, iot *influxdb3.Client,
 // ─────────────────────────────────────────────────────────────────────────────
 
 // parseMsg routes an incoming MQTT message to the correct decoder.
-func parseMsg(ctx context.Context, iot *influxdb3.Client, provider, deviceID, devEUI string, config DeviceConfig, message string, reg registrySnapshot) {
+func parseMsg(sensorWriter *batchWriter, provider, deviceID, devEUI string, config DeviceConfig, message string, reg registrySnapshot) {
 	if message == "" {
 		return
 	}
@@ -1066,7 +1079,7 @@ func parseMsg(ctx context.Context, iot *influxdb3.Client, provider, deviceID, de
 
 	case "custom":
 		// Direct MQTT device: raw JSON, no LNS frame wrapping.
-		parseDeviceModel(ctx, iot, deviceID, "", config, "custom", message, 0, time.Time{}, reg)
+		parseDeviceModel(sensorWriter, deviceID, "", config, "custom", message, 0, time.Time{}, reg)
 
 	case "chirpstackv4":
 		frame, err := chirpstack.Parse(message)
@@ -1074,7 +1087,7 @@ func parseMsg(ctx context.Context, iot *influxdb3.Client, provider, deviceID, de
 			log.Printf("[parseMsg/chirpstackv4] %v (deviceID=%s)", err, deviceID)
 			return
 		}
-		parseDeviceModel(ctx, iot, deviceID, devEUI, config, "chirpstackv4", frame.Data, frame.Port, frame.Timestamp, reg)
+		parseDeviceModel(sensorWriter, deviceID, devEUI, config, "chirpstackv4", frame.Data, frame.Port, frame.Timestamp, reg)
 
 	case "everynet":
 		frame, err := everynet.Parse(message)
@@ -1082,7 +1095,7 @@ func parseMsg(ctx context.Context, iot *influxdb3.Client, provider, deviceID, de
 			log.Printf("[parseMsg/everynet] %v (deviceID=%s)", err, deviceID)
 			return
 		}
-		parseDeviceModel(ctx, iot, deviceID, devEUI, config, "everynet", frame.Data, frame.Port, frame.Timestamp, reg)
+		parseDeviceModel(sensorWriter, deviceID, devEUI, config, "everynet", frame.Data, frame.Port, frame.Timestamp, reg)
 
 	default:
 		log.Printf("[parseMsg] unsupported provider=%s for device_id=%s (%.80s…)", provider, deviceID, message)
@@ -1119,11 +1132,6 @@ func resolveIncomingDevice(provider, topicIdentifier string, deviceMap map[strin
 // MQTT handler + main
 // ─────────────────────────────────────────────────────────────────────────────
 
-func connLostHandler(c MQTT.Client, err error) {
-	fmt.Printf("MQTT connection lost: %v\n", err)
-	os.Exit(1)
-}
-
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found; using environment variables")
@@ -1136,21 +1144,13 @@ func main() {
 		INFLUXDB_HOST = "http://influxdb.maua.br:8181"
 	}
 	INFLUXDB_TOKEN := os.Getenv("INFLUXDB_TOKEN")
-	DEVICE_REGISTRY_FILE := os.Getenv("DEVICE_REGISTRY_FILE")
-	if DEVICE_REGISTRY_FILE == "" {
-		DEVICE_REGISTRY_FILE = "devices.json"
-	}
-	ASSET_REGISTRY_FILE := os.Getenv("ASSET_REGISTRY_FILE")
-	if ASSET_REGISTRY_FILE == "" {
-		ASSET_REGISTRY_FILE = "assets.json"
-	}
-	SENSOR_REGISTRY_FILE := os.Getenv("SENSOR_REGISTRY_FILE")
-	if SENSOR_REGISTRY_FILE == "" {
-		SENSOR_REGISTRY_FILE = "sensors.json"
-	}
-	DEVICE_CHANNEL_REGISTRY_FILE := os.Getenv("DEVICE_CHANNEL_REGISTRY_FILE")
-	if DEVICE_CHANNEL_REGISTRY_FILE == "" {
-		DEVICE_CHANNEL_REGISTRY_FILE = "device_channels.json"
+	// REGISTRY_API_URL points at the SmartCampusMaua `api` repo's registry
+	// endpoints (devices/assets/sensors/modbus-channels) — the source of
+	// truth for all four now, replacing this repo's own JSON files. Reads
+	// are open on that API; no token needed.
+	REGISTRY_API_URL := os.Getenv("REGISTRY_API_URL")
+	if REGISTRY_API_URL == "" {
+		REGISTRY_API_URL = "http://localhost:3333"
 	}
 	DEVICE_REGISTRY_REFRESH_SEC := 30
 	if raw := os.Getenv("DEVICE_REGISTRY_REFRESH_SEC"); raw != "" {
@@ -1158,8 +1158,21 @@ func main() {
 			DEVICE_REGISTRY_REFRESH_SEC = v
 		}
 	}
-
-	ctx := context.Background()
+	// WRITE_FLUSH_INTERVAL_SEC/WRITE_BATCH_SIZE tune the batchWriter fan-in
+	// (see its doc comment) — how long a batch of points sits buffered
+	// before being flushed, and how many points force an early flush.
+	WRITE_FLUSH_INTERVAL_SEC := 5
+	if raw := os.Getenv("WRITE_FLUSH_INTERVAL_SEC"); raw != "" {
+		if v, convErr := strconv.Atoi(raw); convErr == nil && v > 0 {
+			WRITE_FLUSH_INTERVAL_SEC = v
+		}
+	}
+	WRITE_BATCH_SIZE := 5000
+	if raw := os.Getenv("WRITE_BATCH_SIZE"); raw != "" {
+		if v, convErr := strconv.Atoi(raw); convErr == nil && v > 0 {
+			WRITE_BATCH_SIZE = v
+		}
+	}
 
 	// Initialize all four InfluxDB3 clients on the same host+token.
 	// Database names are hardcoded; each client writes to a different database.
@@ -1209,73 +1222,84 @@ func main() {
 	defer clients.Close()
 	log.Printf("InfluxDB3: host=%s databases=[iot_sensors, audit_iot, vehicle_telemetry, audit_vehicle] (all on same host+token)", INFLUXDB_HOST)
 
-	deviceMap, devEUIToDeviceID, err := GetDevicesMap(DEVICE_REGISTRY_FILE)
+	// Exactly one goroutine each ever calls WritePoints against iot_sensors /
+	// audit_iot from here on — see batchWriter's doc comment for why (every
+	// decode worker calling WritePoints directly, once per MQTT message,
+	// fragmented InfluxDB3's Parquet files: confirmed via direct inspection,
+	// 2-4 separate files per 10-minute window instead of one, eventually
+	// exceeding InfluxDB3's file-scan cap on ordinary time-range queries).
+	flushInterval := time.Duration(WRITE_FLUSH_INTERVAL_SEC) * time.Second
+	sensorWriter := newBatchWriter(clients.IoTSensors, "sensor_data", flushInterval, WRITE_BATCH_SIZE)
+	auditWriter := newBatchWriter(clients.AuditIoT, "raw", flushInterval, WRITE_BATCH_SIZE)
+	log.Printf("[main] batch writers started: flushInterval=%s batchSize=%d", flushInterval, WRITE_BATCH_SIZE)
+
+	deviceMap, devEUIToDeviceID, err := GetDevicesMap(REGISTRY_API_URL)
 	if err != nil {
-		panic(fmt.Sprintf("failed to load device registry (%s): %v", DEVICE_REGISTRY_FILE, err))
+		panic(fmt.Sprintf("failed to load device registry (%s): %v", REGISTRY_API_URL, err))
 	}
-	log.Printf("Device registry: file=%s deviceIDs=%d devEUI mappings=%d", DEVICE_REGISTRY_FILE, len(deviceMap), len(devEUIToDeviceID))
+	log.Printf("Device registry: api=%s deviceIDs=%d devEUI mappings=%d", REGISTRY_API_URL, len(deviceMap), len(devEUIToDeviceID))
 
 	// Asset registry is supplementary metadata (no decoder depends on it), so
-	// a bad/missing assets.json logs a warning and starts with no asset links
-	// rather than crashing the service like a bad devices.json would.
-	assetByDeviceID, assetErr := GetAssetsMap(ASSET_REGISTRY_FILE)
+	// a bad/unreachable registry API logs a warning and starts with no asset
+	// validation rather than crashing the service like a bad device fetch would.
+	validAssetIDs, assetErr := GetAssetIDSet(REGISTRY_API_URL)
 	if assetErr != nil {
-		log.Printf("[registry] warning: failed to load asset registry (%s): %v", ASSET_REGISTRY_FILE, assetErr)
-		assetByDeviceID = map[string]AssetConfig{}
+		log.Printf("[registry] warning: failed to load asset registry (%s): %v", REGISTRY_API_URL, assetErr)
+		validAssetIDs = map[string]bool{}
 	}
-	mergeAssetInfo(deviceMap, assetByDeviceID)
-	log.Printf("Asset registry: file=%s deviceLinks=%d", ASSET_REGISTRY_FILE, len(assetByDeviceID))
+	log.Printf("Asset registry: api=%s assets=%d", REGISTRY_API_URL, len(validAssetIDs))
 
 	// Sensor and device-channel registries are supplementary metadata (no
 	// decoder depends on them to produce a value — only to tag it with a
-	// stable sensor_id), so a bad/missing file logs a warning and starts
-	// with empty maps rather than crashing the service, mirroring assets.json.
-	sensorMap, sensorErr := GetSensorsMap(SENSOR_REGISTRY_FILE)
+	// stable sensor_id), so a bad/unreachable fetch logs a warning and starts
+	// with empty maps rather than crashing the service, mirroring assets.
+	sensorMap, sensorErr := GetSensorsMap(REGISTRY_API_URL)
 	if sensorErr != nil {
-		log.Printf("[registry] warning: failed to load sensor registry (%s): %v", SENSOR_REGISTRY_FILE, sensorErr)
+		log.Printf("[registry] warning: failed to load sensor registry (%s): %v", REGISTRY_API_URL, sensorErr)
 		sensorMap = map[string]SensorConfig{}
 	}
-	deviceChannels, channelErr := GetDeviceChannelsMap(DEVICE_CHANNEL_REGISTRY_FILE, deviceMap)
+	validateAssetReferences(deviceMap, sensorMap, validAssetIDs)
+	deviceChannels, channelErr := GetDeviceChannelsMap(REGISTRY_API_URL)
 	if channelErr != nil {
-		log.Printf("[registry] warning: failed to load device channel registry (%s): %v", DEVICE_CHANNEL_REGISTRY_FILE, channelErr)
+		log.Printf("[registry] warning: failed to load device channel registry (%s): %v", REGISTRY_API_URL, channelErr)
 		deviceChannels = map[string]DeviceChannels{}
 	}
 	sensorIndex := buildSensorIndex(sensorMap)
-	log.Printf("Sensor registry: file=%s sensors=%d index=%d", SENSOR_REGISTRY_FILE, len(sensorMap), len(sensorIndex))
-	log.Printf("Device channel registry: file=%s devicesWithChannels=%d", DEVICE_CHANNEL_REGISTRY_FILE, len(deviceChannels))
+	log.Printf("Sensor registry: api=%s sensors=%d index=%d", REGISTRY_API_URL, len(sensorMap), len(sensorIndex))
+	log.Printf("Device channel registry: api=%s devicesWithChannels=%d", REGISTRY_API_URL, len(deviceChannels))
 
 	var registryMu sync.RWMutex
 	refreshTicker := time.NewTicker(time.Duration(DEVICE_REGISTRY_REFRESH_SEC) * time.Second)
 	defer refreshTicker.Stop()
 	go func() {
 		for range refreshTicker.C {
-			nextDeviceMap, nextDevEUIToDeviceID, reloadErr := GetDevicesMap(DEVICE_REGISTRY_FILE)
+			nextDeviceMap, nextDevEUIToDeviceID, reloadErr := GetDevicesMap(REGISTRY_API_URL)
 			if reloadErr != nil {
 				log.Printf("[registry] reload failed: %v", reloadErr)
 				continue
 			}
-			// Keep the last known-good asset links on a transient assets.json
-			// read/parse failure, rather than wiping every device's asset
-			// assignment just because devices.json happened to reload fine.
-			if nextAssetByDeviceID, assetReloadErr := GetAssetsMap(ASSET_REGISTRY_FILE); assetReloadErr != nil {
-				log.Printf("[registry] asset reload failed, keeping previous asset links: %v", assetReloadErr)
+			// Keep the last known-good asset id set on a transient asset
+			// fetch failure, rather than wiping validation just because the
+			// device fetch happened to succeed.
+			if nextValidAssetIDs, assetReloadErr := GetAssetIDSet(REGISTRY_API_URL); assetReloadErr != nil {
+				log.Printf("[registry] asset reload failed, keeping previous asset id set: %v", assetReloadErr)
 			} else {
-				assetByDeviceID = nextAssetByDeviceID
+				validAssetIDs = nextValidAssetIDs
 			}
-			mergeAssetInfo(nextDeviceMap, assetByDeviceID)
 
-			// Same last-known-good behavior for sensors.json/device_channels.json.
+			// Same last-known-good behavior for sensors/modbus-channels.
 			// Computed into local vars first so deviceChannels/sensorMap/sensorIndex
 			// (all read by workers) flip together atomically under registryMu.
 			nextSensorMap := sensorMap
-			if m, sensorReloadErr := GetSensorsMap(SENSOR_REGISTRY_FILE); sensorReloadErr != nil {
+			if m, sensorReloadErr := GetSensorsMap(REGISTRY_API_URL); sensorReloadErr != nil {
 				log.Printf("[registry] sensor registry reload failed, keeping previous sensor index: %v", sensorReloadErr)
 			} else {
 				nextSensorMap = m
 			}
+			validateAssetReferences(nextDeviceMap, nextSensorMap, validAssetIDs)
 
 			nextDeviceChannels := deviceChannels
-			if m, channelReloadErr := GetDeviceChannelsMap(DEVICE_CHANNEL_REGISTRY_FILE, nextDeviceMap); channelReloadErr != nil {
+			if m, channelReloadErr := GetDeviceChannelsMap(REGISTRY_API_URL); channelReloadErr != nil {
 				log.Printf("[registry] device channel registry reload failed, keeping previous channels: %v", channelReloadErr)
 			} else {
 				nextDeviceChannels = m
@@ -1289,10 +1313,18 @@ func main() {
 			deviceChannels = nextDeviceChannels
 			sensorIndex = nextSensorIndex
 			registryMu.Unlock()
-			log.Printf("[registry] reloaded: file=%s deviceIDs=%d devEUI mappings=%d assetLinks=%d sensors=%d sensorIndex=%d devicesWithChannels=%d",
-				DEVICE_REGISTRY_FILE, len(nextDeviceMap), len(nextDevEUIToDeviceID), len(assetByDeviceID), len(nextSensorMap), len(nextSensorIndex), len(nextDeviceChannels))
+			log.Printf("[registry] reloaded: api=%s deviceIDs=%d devEUI mappings=%d assets=%d sensors=%d sensorIndex=%d devicesWithChannels=%d",
+				REGISTRY_API_URL, len(nextDeviceMap), len(nextDevEUIToDeviceID), len(validAssetIDs), len(nextSensorMap), len(nextSensorIndex), len(nextDeviceChannels))
 		}
 	}()
+
+	// connLost signals the shutdown goroutine below instead of calling
+	// os.Exit directly (as this used to) — an immediate exit would now skip
+	// draining the decode workers and flushing the batch writers, abandoning
+	// up to a full flush interval's worth of buffered points. Buffered size
+	// 1 + non-blocking send: only the first loss matters, Paho may report
+	// more before the process actually exits.
+	connLost := make(chan error, 1)
 
 	id := uuid.New().String()
 	mqttOpts := MQTT.NewClientOptions().
@@ -1300,7 +1332,13 @@ func main() {
 		SetClientID("parse-lns-sub-" + id).
 		SetUsername("public").
 		SetPassword("public").
-		SetConnectionLostHandler(connLostHandler)
+		SetConnectionLostHandler(func(_ MQTT.Client, err error) {
+			log.Printf("MQTT connection lost: %v", err)
+			select {
+			case connLost <- err:
+			default:
+			}
+		})
 
 	incoming := make(chan [2]string, 256)
 	mqttOpts.SetDefaultPublishHandler(func(_ MQTT.Client, msg MQTT.Message) {
@@ -1319,6 +1357,33 @@ func main() {
 		log.Fatal(tok.Error())
 	}
 	log.Printf("MQTT: subscribed to %s", subTopic)
+
+	// Graceful shutdown: on SIGINT/SIGTERM (or an unexpected MQTT connection
+	// loss, see connLost above), stop new MQTT messages from arriving, let
+	// already-queued ones drain through the decode workers, then flush
+	// whatever the batch writers still have buffered — so neither a clean
+	// shutdown (e.g. `docker stop`) nor a dropped connection ever silently
+	// discards buffered points the way an untracked in-flight write would.
+	//
+	// shutdownDueToConnLoss is written here before close(incoming) and only
+	// read after workerWG.Wait() returns below — safe without atomics, since
+	// closing a channel is itself a happens-before synchronization point in
+	// Go's memory model, and that close-then-drain chain is what makes
+	// workerWG.Wait() return in the first place.
+	var shutdownDueToConnLoss bool
+	shutdownSig := make(chan os.Signal, 1)
+	signal.Notify(shutdownSig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-shutdownSig:
+			log.Printf("[main] received %s, shutting down: disconnecting MQTT, draining workers...", sig)
+		case err := <-connLost:
+			shutdownDueToConnLoss = true
+			log.Printf("[main] MQTT connection lost (%v) — shutting down so the process can be restarted...", err)
+		}
+		mqttClient.Disconnect(1000)
+		close(incoming)
+	}()
 
 	// WRITE_WORKERS controls how many goroutines process MQTT messages in parallel.
 	// Each worker handles the full decode+write pipeline for one message.
@@ -1389,14 +1454,31 @@ func main() {
 					log.Printf("[recv] topic=%s provider=%s device_id=%s model=%s", topic, provider, deviceID, config.Model)
 				}
 
-				// Audit log and sensor decode+write run concurrently: they target
-				// different InfluxDB3 databases so there is no ordering requirement.
+				// Audit log and sensor decode+write both just enqueue onto their
+				// own batchWriter now (see its doc comment) — fast, non-blocking
+				// channel sends, no longer worth a dedicated goroutine each like
+				// when writeAuditLog did a direct blocking WritePoints call. That
+				// also avoids a real shutdown race: an untracked `go` here could
+				// still be enqueueing after workerWG.Wait() returns, racing
+				// against auditWriter.Close().
 				auditPayload, auditDeviceID, auditAssetID, auditNow := payload, deviceID, config.AssetID, time.Now()
-				go writeAuditLog(ctx, clients.AuditIoT, auditDeviceID, auditAssetID, auditPayload, auditNow)
+				writeAuditLog(auditWriter, auditDeviceID, auditAssetID, auditPayload, auditNow)
 
-				parseMsg(ctx, clients.IoTSensors, provider, deviceID, devEUI, config, payload, currentReg)
+				parseMsg(sensorWriter, provider, deviceID, devEUI, config, payload, currentReg)
 			}
 		}()
 	}
 	workerWG.Wait()
+
+	// All decode workers have exited (incoming is closed and drained), so
+	// nothing can still be calling Enqueue — safe to close the batch writers
+	// now. Close blocks until each has flushed whatever it still had buffered.
+	log.Printf("[main] all workers drained, flushing batch writers...")
+	sensorWriter.Close()
+	auditWriter.Close()
+	if shutdownDueToConnLoss {
+		log.Printf("[main] shutdown complete (connection loss) — exiting non-zero so the process gets restarted")
+		os.Exit(1)
+	}
+	log.Printf("[main] shutdown complete")
 }

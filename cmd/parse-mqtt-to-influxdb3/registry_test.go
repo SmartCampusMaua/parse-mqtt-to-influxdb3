@@ -1,37 +1,47 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/OpenDataTelemetry/device-gateway-mqtt/go-parse/record"
 )
 
-func writeTempFile(t *testing.T, name, content string) string {
+// newRegistryTestServer starts an httptest server that returns body (a JSON
+// array) for any request — every GetXMap fetcher only ever hits one fixed
+// sub-path per test, so a single canned response is enough. Closed
+// automatically via t.Cleanup.
+func newRegistryTestServer(t *testing.T, body string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("write %s: %v", name, err)
-	}
-	return path
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
 }
 
-func TestGetDevicesMap_NoLongerReadsAssetFields(t *testing.T) {
-	path := writeTempFile(t, "devices.json", `{
-		"version": "1",
-		"devices": [
-			{
-				"device_id": "019b9ae2-fc84-7396-9ea8-fd2a041b7664",
-				"device_model": "em500_swl",
-				"device_type": "lorawan",
-				"serial_number": "SN-1",
-				"dev_eui": "24e124126d284622"
-			}
-		]
-	}`)
+// ─── devices ────────────────────────────────────────────────────────────────
 
-	deviceMap, devEUIToDeviceID, err := GetDevicesMap(path)
+func TestGetDevicesMap_ParsesRowIncludingInlineAssetID(t *testing.T) {
+	apiURL := newRegistryTestServer(t, `[
+		{
+			"id": "019b9ae2-fc84-7396-9ea8-fd2a041b7664",
+			"device_model": "em500_swl",
+			"device_type": "lorawan",
+			"serial_number": "SN-1",
+			"dev_eui": "24e124126d284622",
+			"mac_address": null,
+			"battery_voltage_max": null,
+			"battery_voltage_min": null,
+			"probe_range_m": null,
+			"allow": true,
+			"asset_id": "019df4d6-f351-77a5-a3c2-926523251c47"
+		}
+	]`)
+
+	deviceMap, devEUIToDeviceID, err := GetDevicesMap(apiURL)
 	if err != nil {
 		t.Fatalf("GetDevicesMap: %v", err)
 	}
@@ -39,84 +49,96 @@ func TestGetDevicesMap_NoLongerReadsAssetFields(t *testing.T) {
 		t.Fatalf("expected 1 device, got deviceMap=%d devEUI=%d", len(deviceMap), len(devEUIToDeviceID))
 	}
 	cfg := deviceMap["019b9ae2-fc84-7396-9ea8-fd2a041b7664"]
-	if cfg.AssetID != "" || cfg.AssetCoords != (AssetCoords{}) {
-		t.Errorf("expected zero-value asset info from devices.json alone, got %+v", cfg)
+	// asset_id now comes straight from the device's own row — no separate
+	// asset-registry cross-reference/merge step needed anymore.
+	if cfg.AssetID != "019df4d6-f351-77a5-a3c2-926523251c47" {
+		t.Errorf("expected asset_id inline from the device row, got %q", cfg.AssetID)
+	}
+	if cfg.SerialNumber != "SN-1" || cfg.DeviceType != "LORAWAN" {
+		t.Errorf("got %+v", cfg)
+	}
+	if devEUIToDeviceID["24e124126d284622"] != "019b9ae2-fc84-7396-9ea8-fd2a041b7664" {
+		t.Errorf("devEUI mapping missing or wrong: %+v", devEUIToDeviceID)
 	}
 }
 
-func TestGetAssetsMap_ResolvesDeviceIDs(t *testing.T) {
-	path := writeTempFile(t, "assets.json", `{
-		"version": "1",
-		"assets": [
-			{
-				"asset_id": "019df4d6-f351-77a5-a3c2-926523251c47",
-				"asset_coords": { "lat": -23.565, "lng": -46.655, "alt": 760 },
-				"device_ids": [
-					"019b9ae2-fc84-7396-9ea8-fd2a041b7664",
-					"019c2f32-0637-7304-8bc3-bc5c58b2961c"
-				]
-			}
-		]
-	}`)
+func TestGetDevicesMap_SkipsDisallowedDevices(t *testing.T) {
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "019b9ae2-fc84-7396-9ea8-fd2a041b7664", "device_model": "em500_swl", "device_type": "lorawan", "dev_eui": "24e124126d284622", "allow": false}
+	]`)
 
-	assetByDeviceID, err := GetAssetsMap(path)
+	deviceMap, _, err := GetDevicesMap(apiURL)
 	if err != nil {
-		t.Fatalf("GetAssetsMap: %v", err)
+		t.Fatalf("GetDevicesMap: %v", err)
 	}
-	if len(assetByDeviceID) != 2 {
-		t.Fatalf("expected 2 device links, got %d", len(assetByDeviceID))
-	}
-	for _, deviceID := range []string{
-		"019b9ae2-fc84-7396-9ea8-fd2a041b7664",
-		"019c2f32-0637-7304-8bc3-bc5c58b2961c",
-	} {
-		cfg, ok := assetByDeviceID[deviceID]
-		if !ok {
-			t.Fatalf("device %s not resolved to an asset", deviceID)
-		}
-		if cfg.AssetID != "019df4d6-f351-77a5-a3c2-926523251c47" {
-			t.Errorf("device %s: got asset_id %s", deviceID, cfg.AssetID)
-		}
-		if cfg.AssetCoords.Lat != -23.565 || cfg.AssetCoords.Lng != -46.655 || cfg.AssetCoords.Alt != 760 {
-			t.Errorf("device %s: got coords %+v", deviceID, cfg.AssetCoords)
-		}
+	if len(deviceMap) != 0 {
+		t.Fatalf("expected disallowed device to be skipped, got %d devices", len(deviceMap))
 	}
 }
 
-func TestGetAssetsMap_RejectsDuplicateAssetID(t *testing.T) {
-	path := writeTempFile(t, "assets.json", `{
-		"version": "1",
-		"assets": [
-			{"asset_id": "019df4d6-f351-77a5-a3c2-926523251c47", "device_ids": []},
-			{"asset_id": "019df4d6-f351-77a5-a3c2-926523251c47", "device_ids": []}
-		]
-	}`)
+func TestGetDevicesMap_RejectsDuplicateDevEUI(t *testing.T) {
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "019b9ae2-fc84-7396-9ea8-fd2a041b7664", "device_model": "em500_swl", "device_type": "lorawan", "dev_eui": "24e124126d284622", "allow": true},
+		{"id": "019c2f32-0637-7304-8bc3-bc5c58b2961c", "device_model": "em500_swl", "device_type": "lorawan", "dev_eui": "24e124126d284622", "allow": true}
+	]`)
 
-	if _, err := GetAssetsMap(path); err == nil {
-		t.Fatal("expected error for duplicate asset_id, got nil")
+	if _, _, err := GetDevicesMap(apiURL); err == nil {
+		t.Fatal("expected error for duplicate dev_eui, got nil")
 	}
 }
 
-func TestMergeAssetInfo_BackfillsDeviceConfig(t *testing.T) {
-	deviceMap := map[string]DeviceConfig{
-		"dev-1": {Model: "EM500_SWL"},
-		"dev-2": {Model: "DTL200"},
-	}
-	assetByDeviceID := map[string]AssetConfig{
-		"dev-1": {AssetID: "asset-1", AssetCoords: AssetCoords{Lat: 1, Lng: 2, Alt: 3}},
-	}
+// ─── assets ─────────────────────────────────────────────────────────────────
 
-	mergeAssetInfo(deviceMap, assetByDeviceID)
+func TestGetAssetIDSet_ParsesRows(t *testing.T) {
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "019df4d6-f351-77a5-a3c2-926523251c47"},
+		{"id": "019df4d6-f351-77a5-a3c2-926523251c48"}
+	]`)
 
-	if deviceMap["dev-1"].AssetID != "asset-1" {
-		t.Errorf("dev-1: expected asset-1, got %q", deviceMap["dev-1"].AssetID)
+	ids, err := GetAssetIDSet(apiURL)
+	if err != nil {
+		t.Fatalf("GetAssetIDSet: %v", err)
 	}
-	if deviceMap["dev-2"].AssetID != "" {
-		t.Errorf("dev-2: expected no asset link, got %q", deviceMap["dev-2"].AssetID)
+	if len(ids) != 2 || !ids["019df4d6-f351-77a5-a3c2-926523251c47"] || !ids["019df4d6-f351-77a5-a3c2-926523251c48"] {
+		t.Errorf("got %+v", ids)
 	}
 }
 
-// ─── sensors.json ──────────────────────────────────────────────────────────
+func TestValidateAssetReferences_HandlesEmptyAndMissingGracefully(t *testing.T) {
+	// Purely a smoke test — this function only logs, never fails a reload;
+	// it must not panic on nil/empty inputs or on a reference to an asset
+	// that doesn't exist.
+	validateAssetReferences(nil, nil, nil)
+	validateAssetReferences(
+		map[string]DeviceConfig{"dev-1": {AssetID: "missing-asset"}},
+		map[string]SensorConfig{"sensor-1": {AssetID: "also-missing"}},
+		map[string]bool{"real-asset": true},
+	)
+}
+
+// ─── effectiveAssetID (sensor asset_id override vs device's own) ───────────
+
+func TestEffectiveAssetID_SensorOverrideWins(t *testing.T) {
+	got := effectiveAssetID("device-asset", SensorConfig{AssetID: "sensor-override-asset"})
+	if got != "sensor-override-asset" {
+		t.Errorf("got %q, want sensor override to win", got)
+	}
+}
+
+func TestEffectiveAssetID_FallsBackToDeviceWhenSensorHasNoOverride(t *testing.T) {
+	got := effectiveAssetID("device-asset", SensorConfig{})
+	if got != "device-asset" {
+		t.Errorf("got %q, want device's own asset_id", got)
+	}
+}
+
+func TestEffectiveAssetID_BothEmptyYieldsEmpty(t *testing.T) {
+	if got := effectiveAssetID("", SensorConfig{}); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// ─── sensors ────────────────────────────────────────────────────────────────
 
 const (
 	testDeviceIDUC300 = "01a03953-9387-7631-b960-5d7f9305a67c"
@@ -128,15 +150,12 @@ const (
 )
 
 func TestGetSensorsMap_LoadsAndValidates(t *testing.T) {
-	path := writeTempFile(t, "sensors.json", `{
-		"version": "1",
-		"sensors": [
-			{"sensor_id": "`+testSensorID1+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"},
-			{"sensor_id": "`+testSensorID2+`", "sensor_type": "battery_level", "device_id": "`+testDeviceIDUC300+`"}
-		]
-	}`)
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "`+testSensorID1+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"},
+		{"id": "`+testSensorID2+`", "sensor_type": "battery_level", "device_id": "`+testDeviceIDUC300+`"}
+	]`)
 
-	sensorMap, err := GetSensorsMap(path)
+	sensorMap, err := GetSensorsMap(apiURL)
 	if err != nil {
 		t.Fatalf("GetSensorsMap: %v", err)
 	}
@@ -150,14 +169,11 @@ func TestGetSensorsMap_LoadsAndValidates(t *testing.T) {
 }
 
 func TestGetSensorsMap_RejectsUnknownSensorType(t *testing.T) {
-	path := writeTempFile(t, "sensors.json", `{
-		"version": "1",
-		"sensors": [
-			{"sensor_id": "`+testSensorID1+`", "sensor_type": "not_a_real_sensor_type", "device_id": "`+testDeviceIDUC300+`"}
-		]
-	}`)
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "`+testSensorID1+`", "sensor_type": "not_a_real_sensor_type", "device_id": "`+testDeviceIDUC300+`"}
+	]`)
 
-	if _, err := GetSensorsMap(path); err == nil {
+	if _, err := GetSensorsMap(apiURL); err == nil {
 		t.Fatal("expected error for unrecognized sensor_type, got nil")
 	}
 }
@@ -165,15 +181,12 @@ func TestGetSensorsMap_RejectsUnknownSensorType(t *testing.T) {
 func TestGetSensorsMap_AllowsSameSensorTypeTwiceOnOneDeviceViaDeviceIndex(t *testing.T) {
 	// Two identical probes on one device — same sensor_type, distinct
 	// sensor_id, disambiguated by device_index.
-	path := writeTempFile(t, "sensors.json", `{
-		"version": "1",
-		"sensors": [
-			{"sensor_id": "`+testSensorID1+`", "sensor_type": "soil_moisture_raw", "device_id": "`+testDeviceIDUC300+`", "device_index": 1},
-			{"sensor_id": "`+testSensorID2+`", "sensor_type": "soil_moisture_raw", "device_id": "`+testDeviceIDUC300+`", "device_index": 2}
-		]
-	}`)
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "`+testSensorID1+`", "sensor_type": "soil_moisture_raw", "device_id": "`+testDeviceIDUC300+`", "device_index": 1},
+		{"id": "`+testSensorID2+`", "sensor_type": "soil_moisture_raw", "device_id": "`+testDeviceIDUC300+`", "device_index": 2}
+	]`)
 
-	sensorMap, err := GetSensorsMap(path)
+	sensorMap, err := GetSensorsMap(apiURL)
 	if err != nil {
 		t.Fatalf("GetSensorsMap: %v", err)
 	}
@@ -187,30 +200,24 @@ func TestGetSensorsMap_AllowsSameSensorTypeTwiceOnOneDeviceViaDeviceIndex(t *tes
 
 func TestGetSensorsMap_RejectsDuplicateDeviceIndexTuple(t *testing.T) {
 	// Same device_id+sensor_type+device_index (both default to 0) claimed by
-	// two different sensor_ids — a genuine config error, not legitimate
+	// two different sensor ids — a genuine config error, not legitimate
 	// multi-instance disambiguation.
-	path := writeTempFile(t, "sensors.json", `{
-		"version": "1",
-		"sensors": [
-			{"sensor_id": "`+testSensorID1+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"},
-			{"sensor_id": "`+testSensorID2+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"}
-		]
-	}`)
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "`+testSensorID1+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"},
+		{"id": "`+testSensorID2+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"}
+	]`)
 
-	if _, err := GetSensorsMap(path); err == nil {
+	if _, err := GetSensorsMap(apiURL); err == nil {
 		t.Fatal("expected error for duplicate device_id/sensor_type/device_index tuple, got nil")
 	}
 }
 
-func TestGetSensorsMap_LoadsSensorName(t *testing.T) {
-	path := writeTempFile(t, "sensors.json", `{
-		"version": "1",
-		"sensors": [
-			{"sensor_id": "`+testSensorID1+`", "sensor_type": "soil_moisture_raw", "device_id": "`+testDeviceIDUC300+`", "device_index": 1, "sensor_name": "Depth 10cm"}
-		]
-	}`)
+func TestGetSensorsMap_LoadsSensorNameAndAssetOverride(t *testing.T) {
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "`+testSensorID1+`", "sensor_type": "soil_moisture_raw", "device_id": "`+testDeviceIDUC300+`", "device_index": 1, "sensor_name": "Depth 10cm", "asset_id": "019df4d6-f351-77a5-a3c2-926523251c47"}
+	]`)
 
-	sensorMap, err := GetSensorsMap(path)
+	sensorMap, err := GetSensorsMap(apiURL)
 	if err != nil {
 		t.Fatalf("GetSensorsMap: %v", err)
 	}
@@ -218,34 +225,30 @@ func TestGetSensorsMap_LoadsSensorName(t *testing.T) {
 	if got.SensorName != "Depth 10cm" {
 		t.Errorf("SensorName: got %q, want %q", got.SensorName, "Depth 10cm")
 	}
-}
-
-func TestGetSensorsMap_RejectsDuplicateSensorID(t *testing.T) {
-	path := writeTempFile(t, "sensors.json", `{
-		"version": "1",
-		"sensors": [
-			{"sensor_id": "`+testSensorID1+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"},
-			{"sensor_id": "`+testSensorID1+`", "sensor_type": "battery_level", "device_id": "`+testDeviceIDUC300+`"}
-		]
-	}`)
-
-	if _, err := GetSensorsMap(path); err == nil {
-		t.Fatal("expected error for duplicate sensor_id, got nil")
+	if got.AssetID != "019df4d6-f351-77a5-a3c2-926523251c47" {
+		t.Errorf("AssetID override: got %q", got.AssetID)
 	}
 }
 
-// ─── device_channels.json ──────────────────────────────────────────────────
+func TestGetSensorsMap_RejectsDuplicateSensorID(t *testing.T) {
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "`+testSensorID1+`", "sensor_type": "water_level", "device_id": "`+testDeviceIDUC300+`"},
+		{"id": "`+testSensorID1+`", "sensor_type": "battery_level", "device_id": "`+testDeviceIDUC300+`"}
+	]`)
 
-func TestGetDeviceChannelsMap_ResolvesModbusAndIO(t *testing.T) {
-	path := writeTempFile(t, "device_channels.json", `{
-		"version": "1",
-		"channels": [
-			{"device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID1+`", "modbus_channel": 5, "modbus_slave_id": 2},
-			{"device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID2+`", "io_channel": 9}
-		]
-	}`)
+	if _, err := GetSensorsMap(apiURL); err == nil {
+		t.Fatal("expected error for duplicate sensor id, got nil")
+	}
+}
 
-	dcMap, err := GetDeviceChannelsMap(path, nil)
+// ─── modbus-channels ────────────────────────────────────────────────────────
+
+func TestGetDeviceChannelsMap_ResolvesModbus(t *testing.T) {
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "f7f2e152-df25-499c-9ca5-c458bb8a8a37", "device_id": "`+testDeviceIDUC300+`", "bus_type": "modbus_rs485", "sensor_id": "`+testSensorID1+`", "modbus_channel": 5, "modbus_slave_id": 2}
+	]`)
+
+	dcMap, err := GetDeviceChannelsMap(apiURL)
 	if err != nil {
 		t.Fatalf("GetDeviceChannelsMap: %v", err)
 	}
@@ -256,92 +259,41 @@ func TestGetDeviceChannelsMap_ResolvesModbusAndIO(t *testing.T) {
 	if dc.Modbus[5] != testSensorID1 {
 		t.Errorf("modbus_channel 5: got %q, want %q", dc.Modbus[5], testSensorID1)
 	}
-	if dc.IO[9] != testSensorID2 {
-		t.Errorf("io_channel 9: got %q, want %q", dc.IO[9], testSensorID2)
-	}
-}
-
-func TestGetDeviceChannelsMap_RejectsUC100WithIO(t *testing.T) {
-	path := writeTempFile(t, "device_channels.json", `{
-		"version": "1",
-		"channels": [
-			{"device_id": "`+testDeviceIDUC100+`", "sensor_id": "`+testSensorID4+`", "io_channel": 9}
-		]
-	}`)
-	deviceMap := map[string]DeviceConfig{
-		testDeviceIDUC100: {Model: UC100},
-	}
-
-	if _, err := GetDeviceChannelsMap(path, deviceMap); err == nil {
-		t.Fatal("expected error for io_channel on a uc100 device, got nil")
-	}
-}
-
-func TestGetDeviceChannelsMap_AllowsIOWhenDeviceUnknown(t *testing.T) {
-	// device_id not (yet) present in devices.json — should not block loading,
-	// same "not yet resolvable" leniency as elsewhere in this file.
-	path := writeTempFile(t, "device_channels.json", `{
-		"version": "1",
-		"channels": [
-			{"device_id": "`+testDeviceIDUC100+`", "sensor_id": "`+testSensorID4+`", "io_channel": 9}
-		]
-	}`)
-
-	if _, err := GetDeviceChannelsMap(path, map[string]DeviceConfig{}); err != nil {
-		t.Fatalf("expected no error when device_id isn't in deviceMap, got: %v", err)
-	}
-}
-
-func TestGetDeviceChannelsMap_RejectsBothModbusAndIO(t *testing.T) {
-	path := writeTempFile(t, "device_channels.json", `{
-		"version": "1",
-		"channels": [
-			{"device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID1+`", "modbus_channel": 5, "modbus_slave_id": 2, "io_channel": 9}
-		]
-	}`)
-
-	if _, err := GetDeviceChannelsMap(path, nil); err == nil {
-		t.Fatal("expected error for an entry set as both modbus and io, got nil")
+	// The registry API has no io-channels endpoint yet — IO must always come
+	// back empty, never nil (so callers can index it unconditionally).
+	if dc.IO == nil || len(dc.IO) != 0 {
+		t.Errorf("expected IO to be an empty (non-nil) map, got %+v", dc.IO)
 	}
 }
 
 func TestGetDeviceChannelsMap_RejectsDuplicateChannelNumber(t *testing.T) {
-	path := writeTempFile(t, "device_channels.json", `{
-		"version": "1",
-		"channels": [
-			{"device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID1+`", "modbus_channel": 5, "modbus_slave_id": 2},
-			{"device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID2+`", "modbus_channel": 5, "modbus_slave_id": 3}
-		]
-	}`)
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "a", "device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID1+`", "modbus_channel": 5, "modbus_slave_id": 2},
+		{"id": "b", "device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID2+`", "modbus_channel": 5, "modbus_slave_id": 3}
+	]`)
 
-	if _, err := GetDeviceChannelsMap(path, nil); err == nil {
+	if _, err := GetDeviceChannelsMap(apiURL); err == nil {
 		t.Fatal("expected error for two sensors claiming the same modbus_channel, got nil")
 	}
 }
 
 func TestGetDeviceChannelsMap_RejectsDuplicateSensorID(t *testing.T) {
-	path := writeTempFile(t, "device_channels.json", `{
-		"version": "1",
-		"channels": [
-			{"device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID1+`", "modbus_channel": 5, "modbus_slave_id": 2},
-			{"device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID1+`", "modbus_channel": 6, "modbus_slave_id": 2}
-		]
-	}`)
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "a", "device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID1+`", "modbus_channel": 5, "modbus_slave_id": 2},
+		{"id": "b", "device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID1+`", "modbus_channel": 6, "modbus_slave_id": 2}
+	]`)
 
-	if _, err := GetDeviceChannelsMap(path, nil); err == nil {
+	if _, err := GetDeviceChannelsMap(apiURL); err == nil {
 		t.Fatal("expected error for the same sensor_id claiming two channels, got nil")
 	}
 }
 
-func TestGetDeviceChannelsMap_RejectsPartialModbusFields(t *testing.T) {
-	path := writeTempFile(t, "device_channels.json", `{
-		"version": "1",
-		"channels": [
-			{"device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID3+`", "modbus_channel": 5}
-		]
-	}`)
+func TestGetDeviceChannelsMap_RejectsMissingModbusSlaveID(t *testing.T) {
+	apiURL := newRegistryTestServer(t, `[
+		{"id": "a", "device_id": "`+testDeviceIDUC300+`", "sensor_id": "`+testSensorID3+`", "modbus_channel": 5, "modbus_slave_id": 0}
+	]`)
 
-	if _, err := GetDeviceChannelsMap(path, nil); err == nil {
+	if _, err := GetDeviceChannelsMap(apiURL); err == nil {
 		t.Fatal("expected error for modbus_channel without modbus_slave_id, got nil")
 	}
 }
@@ -467,8 +419,8 @@ func TestResolveChannelRecord_DropsUnconfiguredChannel(t *testing.T) {
 			testSensorID1: {SensorType: "water_level", DeviceID: testDeviceIDUC300},
 		},
 	}
-	// Channel 5 has no device_channels.json entry — must never be written
-	// under a fabricated or empty sensor_type.
+	// Channel 5 has no modbus-channels registry entry — must never be
+	// written under a fabricated or empty sensor_type.
 	r := &record.SensorDataRecord{ModbusChannel: 5}
 
 	if ok := resolveChannelRecord(r, testDeviceIDUC300, r.ModbusChannel, reg.DeviceChannels[testDeviceIDUC300].Modbus, reg, "modbus"); ok {
@@ -479,10 +431,10 @@ func TestResolveChannelRecord_DropsUnconfiguredChannel(t *testing.T) {
 	}
 }
 
-func TestResolveChannelRecord_DropsWhenSensorIDMissingFromSensorsJSON(t *testing.T) {
-	// device_channels.json references a sensor_id, but sensors.json (loaded
-	// separately, lenient FK) has no matching entry — must not fall back to
-	// writing an empty sensor_type either.
+func TestResolveChannelRecord_DropsWhenSensorIDMissingFromSensorRegistry(t *testing.T) {
+	// device_channels registry references a sensor_id, but the sensor
+	// registry (loaded separately, lenient FK) has no matching entry — must
+	// not fall back to writing an empty sensor_type either.
 	reg := registrySnapshot{
 		DeviceChannels: map[string]DeviceChannels{
 			testDeviceIDUC300: {Modbus: map[int]string{3: testSensorID1}},
@@ -492,7 +444,7 @@ func TestResolveChannelRecord_DropsWhenSensorIDMissingFromSensorsJSON(t *testing
 	r := &record.SensorDataRecord{ModbusChannel: 3}
 
 	if ok := resolveChannelRecord(r, testDeviceIDUC300, r.ModbusChannel, reg.DeviceChannels[testDeviceIDUC300].Modbus, reg, "modbus"); ok {
-		t.Fatal("expected resolution to fail when sensor_id has no sensors.json entry")
+		t.Fatal("expected resolution to fail when sensor_id has no sensor registry entry")
 	}
 	if r.SensorType != "" || r.SensorID != "" {
 		t.Errorf("expected record left untouched, got SensorID=%q SensorType=%q", r.SensorID, r.SensorType)
