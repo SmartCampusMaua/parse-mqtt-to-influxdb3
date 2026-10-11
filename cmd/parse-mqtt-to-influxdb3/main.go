@@ -559,6 +559,39 @@ func detectProvider(message string) string {
 	return ""
 }
 
+// undecryptedEverynetProbe additionally captures encrypted_payload — present
+// on some Everynet uplinks instead of the usual params.payload when the
+// network server hasn't decrypted the frame (unregistered/mismatched
+// session keys for this device on Everynet's own platform, not something
+// fixable from this side — see diagnoseUndetectedEverynet). Confirmed live
+// against real traffic from a device registered as everynet whose uplinks
+// carry only encrypted_payload.
+type undecryptedEverynetProbe struct {
+	Type string `json:"type"`
+	Meta struct {
+		Device string `json:"device"`
+	} `json:"meta"`
+	Params struct {
+		Payload          string `json:"payload"`
+		EncryptedPayload string `json:"encrypted_payload"`
+	} `json:"params"`
+}
+
+// diagnoseUndetectedEverynet reports whether message looks like an Everynet
+// uplink that Everynet's own network server failed to decrypt before
+// forwarding — only called on the already-rare "couldn't detect provider"
+// path, so a second JSON parse here costs nothing.
+func diagnoseUndetectedEverynet(message string) (device string, ok bool) {
+	var p undecryptedEverynetProbe
+	if json.Unmarshal([]byte(message), &p) != nil {
+		return "", false
+	}
+	if p.Type == "uplink" && p.Meta.Device != "" && p.Params.Payload == "" && p.Params.EncryptedPayload != "" {
+		return p.Meta.Device, true
+	}
+	return "", false
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Colored logging helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1474,6 +1507,9 @@ func main() {
 					if exists {
 						provider = "custom"
 						log.Printf("[provider] fallback to custom for known device_id=%s model=%s", topicIdentifier, configFromTopic.Model)
+					} else if dev, undecrypted := diagnoseUndetectedEverynet(payload); undecrypted {
+						log.Printf("[drop] everynet device=%s sent an uplink Everynet itself didn't decrypt (encrypted_payload present, no payload) — check this device's session keys/activation on Everynet's console; topic=%s", dev, topic)
+						continue
 					} else {
 						log.Printf("[drop] cannot detect provider topic=%s", topic)
 						continue
