@@ -19,5 +19,8 @@
     "broker": "mqtt.maua.br:1883",
     "username": "",
     "password": ""
+  },
+  "registry": {
+    "api_url": "http://localhost:3333"
   }
 }

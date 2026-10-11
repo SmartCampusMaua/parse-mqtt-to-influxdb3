@@ -36,7 +36,8 @@ connection loss) drains and flushes buffered points before exit.
 
 ## Connection config
 
-InfluxDB3 host/token and MQTT broker/credentials load from `infra.json`
+InfluxDB3 host/token, MQTT broker/credentials, and the registry API's base
+URL (`registry.api_url`) load from `infra.json`
 (`cmd/parse-mqtt-to-influxdb3/infra_config.go`), not env vars — mirrors the
 `api` repo's `influxdb.json`/`config.ts` pattern exactly, `influxdb.orgs`
 array included. This service only ever has one InfluxDB host+token pair, so

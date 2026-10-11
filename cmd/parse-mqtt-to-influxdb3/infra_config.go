@@ -28,15 +28,18 @@ type rawInfraFile struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	} `json:"mqtt"`
+	Registry struct {
+		APIURL string `json:"api_url"`
+	} `json:"registry"`
 }
 
-// InfraConfig holds this service's two external connection targets —
-// InfluxDB3 (one selected org from infra.json's orgs list) and MQTT —
-// loaded from a single JSON file instead of env vars, mirroring the
-// SmartCampusMaua `api` repo's influxdb.json pattern: connection
-// details/secrets live in a file that can be swapped per deployment
-// (bind-mounted in docker-compose, mounted from a k8s ConfigMap/Secret)
-// without baking them into env vars or the image.
+// InfraConfig holds this service's three external connection targets —
+// InfluxDB3 (one selected org from infra.json's orgs list), MQTT, and the
+// SmartCampusMaua `api` repo's registry API — loaded from a single JSON
+// file instead of env vars, mirroring the `api` repo's influxdb.json
+// pattern: connection details/secrets live in a file that can be swapped
+// per deployment (bind-mounted in docker-compose, mounted from a k8s
+// ConfigMap/Secret) without baking them into env vars or the image.
 type InfraConfig struct {
 	InfluxDB struct {
 		Org   string
@@ -47,6 +50,9 @@ type InfraConfig struct {
 		Broker   string
 		Username string
 		Password string
+	}
+	Registry struct {
+		APIURL string
 	}
 }
 
@@ -82,6 +88,7 @@ func loadInfraConfig(path string) (InfraConfig, error) {
 	cfg.MQTT.Broker = file.MQTT.Broker
 	cfg.MQTT.Username = file.MQTT.Username
 	cfg.MQTT.Password = file.MQTT.Password
+	cfg.Registry.APIURL = file.Registry.APIURL
 
 	switch {
 	case cfg.InfluxDB.Host == "":
@@ -94,6 +101,8 @@ func loadInfraConfig(path string) (InfraConfig, error) {
 		return InfraConfig{}, fmt.Errorf("%s: mqtt.username is required", path)
 	case cfg.MQTT.Password == "":
 		return InfraConfig{}, fmt.Errorf("%s: mqtt.password is required", path)
+	case cfg.Registry.APIURL == "":
+		return InfraConfig{}, fmt.Errorf("%s: registry.api_url is required", path)
 	}
 	return cfg, nil
 }

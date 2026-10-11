@@ -7,9 +7,9 @@ to an InfluxDB3 Core instance.
 Device/asset/sensor/Modbus-channel registry data is **not** owned by this
 repo — it's fetched over plain `GET` from the SmartCampusMaua `api` repo's
 Postgres-backed registry endpoints (`REGISTRY_API_URL`, see
-[Environment variables](#environment-variables)), polled on the same
-hot-reload timer this repo has always used. This repo never writes to that
-API; every read route on it is open, no token needed.
+[InfluxDB3 + MQTT + registry API connection config](#influxdb3--mqtt--registry-api-connection-config-infrajson)),
+polled on the same hot-reload timer this repo has always used. This repo
+never writes to that API; every read route on it is open, no token needed.
 
 ---
 
@@ -1082,18 +1082,20 @@ Response shape from `GET .../modbus-channels`:
 
 ---
 
-## InfluxDB3 + MQTT connection config (`infra.json`)
+## InfluxDB3 + MQTT + registry API connection config (`infra.json`)
 
-InfluxDB3 host/token and MQTT broker/credentials are no longer env vars —
-they live in a single JSON file, with `influxdb.orgs` matching the
-SmartCampusMaua `api` repo's `influxdb.json` format exactly (see that repo's
-`src/config.ts`), `allow` included:
+InfluxDB3 host/token, MQTT broker/credentials, and the registry API's base
+URL (`REGISTRY_API_URL`) are no longer env vars — they live in a single JSON
+file, with `influxdb.orgs` matching the SmartCampusMaua `api` repo's
+`influxdb.json` format exactly (see that repo's `src/config.ts`), `allow`
+included:
 
 ```json
 {
   "version": "1",
   "influxdb": { "orgs": [{ "org": "imt", "host": "http://influxdb.maua.br:8181", "token": "..." }] },
-  "mqtt": { "broker": "mqtt.maua.br:1883", "username": "...", "password": "..." }
+  "mqtt": { "broker": "mqtt.maua.br:1883", "username": "...", "password": "..." },
+  "registry": { "api_url": "http://localhost:3333" }
 }
 ```
 
@@ -1102,7 +1104,10 @@ one InfluxDB host+token pair (shared across its four hardcoded databases),
 so it picks the first entry in `orgs` not explicitly disabled via
 `"allow": false` and ignores the rest — there's no runtime org selection
 the way `api` has (by request header/param), just whichever org is first
-and enabled in the file.
+and enabled in the file. `registry.api_url` is required, same as every
+other field here — a missing/empty value fails fast at startup rather than
+silently falling back to a `localhost` default that would never resolve
+inside a container.
 
 Loaded at startup (`cmd/parse-mqtt-to-influxdb3/infra_config.go`), failing
 fast on a missing/invalid file — same "crash at boot rather than run with an
@@ -1147,9 +1152,8 @@ Deployment only needs the right `volumeMounts`/`volumes`, nothing env-related.
 
 | variable                      | default                        | description                                        |
 | -------------------------------- | --------------------------------- | ------------------------------------------------------- |
-| `INFRA_CONFIG_FILE`           | `infra.json`                   | Path to the InfluxDB3/MQTT connection config file (see above). `docker/Dockerfile` bakes this to `/etc/parse-mqtt-to-influxdb3/infra.json` — a Kubernetes manifest should never need to set this itself, only mount the volume at that path |
+| `INFRA_CONFIG_FILE`           | `infra.json`                   | Path to the InfluxDB3/MQTT/registry connection config file (see above). `docker/Dockerfile` bakes this to `/etc/parse-mqtt-to-influxdb3/infra.json` — a Kubernetes manifest should never need to set this itself, only mount the volume at that path |
 | `INFRA_CONFIG_REFRESH_SEC`    | `30`                            | Poll interval (seconds) for detecting a change to `INFRA_CONFIG_FILE` and restarting to pick it up |
-| `REGISTRY_API_URL`            | `http://localhost:3333`        | Base URL of the SmartCampusMaua `api` repo's registry endpoints (devices/assets/sensors/modbus-channels) — plain unauthenticated `GET`, no token needed. Production points this at that API's in-cluster Kubernetes Service address. |
 | `DEVICE_REGISTRY_REFRESH_SEC` | `30`                            | Poll interval (seconds) for hot-reload of all four registry fetches |
 | `WRITE_WORKERS`               | `2 × GOMAXPROCS`                | Number of goroutines decoding/validating MQTT messages in parallel. Decode workers never call InfluxDB3 directly — see `WRITE_FLUSH_INTERVAL_SEC`/`WRITE_BATCH_SIZE` below. |
 | `WRITE_FLUSH_INTERVAL_SEC`    | `5`                             | How often the batch writer flushes buffered points to InfluxDB3, in seconds (or sooner, once `WRITE_BATCH_SIZE` is reached) |

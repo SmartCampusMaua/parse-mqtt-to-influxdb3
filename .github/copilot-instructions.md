@@ -41,7 +41,8 @@ sensors/Modbus-channels come from that same API's `/assets`, `/sensors`, and
 
 ## Connection config
 
-InfluxDB3 host/token and MQTT broker/credentials load from `infra.json`
+InfluxDB3 host/token, MQTT broker/credentials, and the registry API's base
+URL (`registry.api_url`) load from `infra.json`
 (`cmd/parse-mqtt-to-influxdb3/infra_config.go`), mirroring the SmartCampusMaua
 `api` repo's `influxdb.json`/`config.ts` pattern exactly, `influxdb.orgs`
 array included — this service only ever has one InfluxDB host+token pair,

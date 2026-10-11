@@ -1163,11 +1163,10 @@ func main() {
 	// REGISTRY_API_URL points at the SmartCampusMaua `api` repo's registry
 	// endpoints (devices/assets/sensors/modbus-channels) — the source of
 	// truth for all four now, replacing this repo's own JSON files. Reads
-	// are open on that API; no token needed.
-	REGISTRY_API_URL := os.Getenv("REGISTRY_API_URL")
-	if REGISTRY_API_URL == "" {
-		REGISTRY_API_URL = "http://localhost:3333"
-	}
+	// are open on that API; no token needed. Lives in infra.json
+	// (registry.api_url) alongside the other external connection targets,
+	// not an env var — see infra_config.go.
+	REGISTRY_API_URL := infraCfg.Registry.APIURL
 	DEVICE_REGISTRY_REFRESH_SEC := 30
 	if raw := os.Getenv("DEVICE_REGISTRY_REFRESH_SEC"); raw != "" {
 		if v, convErr := strconv.Atoi(raw); convErr == nil && v > 0 {
