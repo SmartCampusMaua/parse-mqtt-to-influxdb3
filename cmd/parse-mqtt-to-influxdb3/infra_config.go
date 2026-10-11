@@ -27,14 +27,15 @@ type InfraConfig struct {
 	} `json:"mqtt"`
 }
 
-// loadInfraConfig reads and validates the infra config file once at startup.
-// Unlike the device/asset/sensor registry (which hot-reloads on a timer
-// because its data legitimately changes independently of a deploy), the
-// InfluxDB3 clients and the MQTT client here are constructed once from this
-// config and never swapped afterward — so there is no background reload
-// timer. A config change takes effect on the next restart, same as changing
-// an env var always did. Fail fast on a bad/missing file: better to crash at
-// boot than run with an empty token or broker address.
+// loadInfraConfig reads and validates the infra config file. Called once at
+// startup (fail fast on a bad/missing file: better to crash at boot than run
+// with an empty token or broker address), and again on a timer in main() —
+// see infraChanged there. Unlike the device/asset/sensor registry, which
+// swaps its data in place on a reload, the InfluxDB3 clients and MQTT
+// connection built from this config can't be hot-swapped safely, so a
+// detected change there triggers a full graceful process restart instead of
+// an in-place update; this function itself has no notion of that, it just
+// reads and validates whatever's at path right now.
 func loadInfraConfig(path string) (InfraConfig, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {

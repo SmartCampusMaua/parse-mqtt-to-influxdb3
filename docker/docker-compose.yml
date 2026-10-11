@@ -20,9 +20,11 @@ services:
       # container, the shared zc2x influxdb3-core is reached by its container
       # name on the docker_default network, not localhost:8181 like
       # ../infra.json (only valid for `go run` on the host). Gitignored,
-      # create it locally; the k8s manifest mounts the equivalent from a
-      # Secret volume instead (see README.md's Kubernetes section).
-      - ../infra.docker.json:/infra.json:ro
+      # create it locally. Mounted at the same path the Dockerfile bakes in
+      # via INFRA_CONFIG_FILE; the k8s manifest mounts the equivalent from a
+      # ConfigMap/Secret volume at that same path (see README.md's
+      # Kubernetes section) instead of setting that env var itself.
+      - ../infra.docker.json:/etc/parse-mqtt-to-influxdb3/infra.json:ro
     networks:
       - zc2x
 

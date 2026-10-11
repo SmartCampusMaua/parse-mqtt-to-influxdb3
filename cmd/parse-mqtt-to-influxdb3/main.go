@@ -1151,6 +1151,15 @@ func main() {
 	INFLUXDB_HOST := infraCfg.InfluxDB.Host
 	INFLUXDB_TOKEN := infraCfg.InfluxDB.Token
 
+	// INFRA_CONFIG_REFRESH_SEC: how often to check INFRA_CONFIG_FILE for a
+	// change — see infraChanged below for what happens when one is found.
+	INFRA_CONFIG_REFRESH_SEC := 30
+	if raw := os.Getenv("INFRA_CONFIG_REFRESH_SEC"); raw != "" {
+		if v, convErr := strconv.Atoi(raw); convErr == nil && v > 0 {
+			INFRA_CONFIG_REFRESH_SEC = v
+		}
+	}
+
 	// REGISTRY_API_URL points at the SmartCampusMaua `api` repo's registry
 	// endpoints (devices/assets/sensors/modbus-channels) — the source of
 	// truth for all four now, replacing this repo's own JSON files. Reads
@@ -1324,6 +1333,38 @@ func main() {
 		}
 	}()
 
+	// infraChanged fires when INFRA_CONFIG_FILE's content changes on disk —
+	// e.g. a Kubernetes ConfigMap volume update, which kubelet syncs into
+	// the mounted directory on its own, with no pod restart and no `kubectl`
+	// command needed on our end. InfluxDB3's clients and the MQTT
+	// connection are live, stateful objects already built from the old
+	// config by this point; rather than hot-swapping them in place (real
+	// risk of a half-migrated connection), the simpler and safer move is to
+	// drive this through the exact same graceful-shutdown path as
+	// SIGTERM/connLost below — drain, flush, exit cleanly — and let
+	// Kubernetes' restart policy bring the container back up, which re-runs
+	// loadInfraConfig from scratch with the new file.
+	infraChanged := make(chan struct{}, 1)
+	go func() {
+		ticker := time.NewTicker(time.Duration(INFRA_CONFIG_REFRESH_SEC) * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			next, reloadErr := loadInfraConfig(INFRA_CONFIG_FILE)
+			if reloadErr != nil {
+				logWarn("[infra] reload check of %s failed, keeping current process: %v", INFRA_CONFIG_FILE, reloadErr)
+				continue
+			}
+			if next != infraCfg {
+				log.Printf("[infra] %s changed — shutting down so Kubernetes restarts the pod with the new config...", INFRA_CONFIG_FILE)
+				select {
+				case infraChanged <- struct{}{}:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
 	// connLost signals the shutdown goroutine below instead of calling
 	// os.Exit directly (as this used to) — an immediate exit would now skip
 	// draining the decode workers and flushing the batch writers, abandoning
@@ -1386,6 +1427,8 @@ func main() {
 		case err := <-connLost:
 			shutdownDueToConnLoss = true
 			log.Printf("[main] MQTT connection lost (%v) — shutting down so the process can be restarted...", err)
+		case <-infraChanged:
+			log.Printf("[main] infra.json changed, shutting down: disconnecting MQTT, draining workers...")
 		}
 		mqttClient.Disconnect(1000)
 		close(incoming)

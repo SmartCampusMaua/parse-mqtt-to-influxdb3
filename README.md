@@ -1101,29 +1101,51 @@ array in the `api` repo, this is a flat object — this service only ever
 talks to one InfluxDB host+token pair (shared across its four hardcoded
 databases), so there's no multi-tenant org list to select from.
 
-Loaded once at startup (`cmd/parse-mqtt-to-influxdb3/infra_config.go`),
-failing fast on a missing/invalid file — same "crash at boot rather than run
-with an empty token" philosophy as `api`'s `config.ts`. No background
-reload: the InfluxDB3 clients and MQTT client are constructed once from this
-config and never swapped afterward, so a reload timer would have nothing to
-act on; a config change takes effect on the next restart, same as changing
-an env var always did.
+Loaded at startup (`cmd/parse-mqtt-to-influxdb3/infra_config.go`), failing
+fast on a missing/invalid file — same "crash at boot rather than run with an
+empty token" philosophy as `api`'s `config.ts`.
+
+**Hot-reload works, but by restarting the process, not by swapping
+connections in place.** Every `INFRA_CONFIG_REFRESH_SEC` seconds (default
+30), `main()` re-reads the file; if it differs from what's currently
+loaded, the service logs why, drains in-flight MQTT messages, flushes
+whatever the batch writers still have buffered, and exits cleanly —
+InfluxDB3's clients and the MQTT connection are live, stateful objects, and
+hot-swapping them in place risks a half-migrated connection, so a full
+process restart rebuilds them from scratch instead. In Kubernetes this
+means the pod's restart policy brings the container back up with the new
+config automatically; no `kubectl rollout restart` or redeploy needed —
+only `kubectl apply -f` on the `ConfigMap`/`Secret` itself.
+
+**This only works if the volume is mounted as a whole directory, not via a
+`subPath`.** A `subPath` mount pins the container to a snapshot of the
+`ConfigMap`/`Secret` key taken at pod start — it never updates in place, so
+`infraChanged` would never fire no matter how long you wait. Mount the
+whole directory (as this repo's own `docker-compose.yml` and any
+Kubernetes manifest should) so kubelet's periodic sync (~1 minute) updates
+the file on disk, which this service's own polling loop then picks up on
+its own schedule.
 
 `infra.json` is gitignored (it holds a live token) — same treatment as the
-old `.env`. Docker Compose bind-mounts a separate, also-gitignored
-`infra.docker.json` at `/infra.json` with `influxdb.host` pointed at the
-in-network `influxdb3-core:8181` instead of `localhost:8181` (see
-`docker/docker-compose.yml`); a real Kubernetes deployment should mount the
-equivalent from a `Secret` volume instead (a plain `subPath` mount is fine
-here specifically, unlike the `api` repo's own config files — this service
-never hot-reloads `infra.json`, so a pod restart is already required for
-any change to take effect, the same as a `subPath` mount would require).
+old `.env`, and deliberately **not** baked into the image, same reasoning as
+`api`'s own `influxdb.json`. What *is* baked in is the path: `docker/Dockerfile`
+sets `ENV INFRA_CONFIG_FILE=/etc/parse-mqtt-to-influxdb3/infra.json`, a fixed
+absolute path (mirroring `api`'s `ENV INFLUXDB_CONFIG_FILE=/etc/api/influxdb.json`)
+— so every deployment mounts to the same well-known path rather than a
+Kubernetes manifest needing its own `env:`/`configMapKeyRef` entry just to
+tell the app where to look. Docker Compose bind-mounts a separate,
+also-gitignored `infra.docker.json` at that same path with `influxdb.host`
+pointed at the in-network `influxdb3-core:8181` instead of `localhost:8181`
+(see `docker/docker-compose.yml`); a real Kubernetes deployment mounts the
+equivalent from a `ConfigMap`/`Secret` volume at that path instead — the
+Deployment only needs the right `volumeMounts`/`volumes`, nothing env-related.
 
 ## Environment variables
 
 | variable                      | default                        | description                                        |
 | -------------------------------- | --------------------------------- | ------------------------------------------------------- |
-| `INFRA_CONFIG_FILE`           | `infra.json`                   | Path to the InfluxDB3/MQTT connection config file (see above) |
+| `INFRA_CONFIG_FILE`           | `infra.json`                   | Path to the InfluxDB3/MQTT connection config file (see above). `docker/Dockerfile` bakes this to `/etc/parse-mqtt-to-influxdb3/infra.json` — a Kubernetes manifest should never need to set this itself, only mount the volume at that path |
+| `INFRA_CONFIG_REFRESH_SEC`    | `30`                            | Poll interval (seconds) for detecting a change to `INFRA_CONFIG_FILE` and restarting to pick it up |
 | `REGISTRY_API_URL`            | `http://localhost:3333`        | Base URL of the SmartCampusMaua `api` repo's registry endpoints (devices/assets/sensors/modbus-channels) — plain unauthenticated `GET`, no token needed. Production points this at that API's in-cluster Kubernetes Service address. |
 | `DEVICE_REGISTRY_REFRESH_SEC` | `30`                            | Poll interval (seconds) for hot-reload of all four registry fetches |
 | `WRITE_WORKERS`               | `2 × GOMAXPROCS`                | Number of goroutines decoding/validating MQTT messages in parallel. Decode workers never call InfluxDB3 directly — see `WRITE_FLUSH_INTERVAL_SEC`/`WRITE_BATCH_SIZE` below. |

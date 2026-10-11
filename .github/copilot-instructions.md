@@ -44,9 +44,16 @@ sensors/Modbus-channels come from that same API's `/assets`, `/sensors`, and
 InfluxDB3 host/token and MQTT broker/credentials load from `infra.json`
 (`cmd/parse-mqtt-to-influxdb3/infra_config.go`), mirroring the SmartCampusMaua
 `api` repo's `influxdb.json`/`config.ts` pattern — a flat object (no
-multi-org list; this service only ever has one InfluxDB host+token), loaded
-once at startup, failing fast on a missing/invalid file. Gitignored, holds a
-live token — see `infra.example.json` for the shape.
+multi-org list; this service only ever has one InfluxDB host+token), failing
+fast on a missing/invalid file at startup. Gitignored, holds a live token —
+see `infra.example.json` for the shape. Polled every
+`INFRA_CONFIG_REFRESH_SEC` (default 30s); a change triggers a full graceful
+restart (drain, flush, exit) rather than hot-swapping the live InfluxDB3/MQTT
+clients — requires the volume mounted as a whole directory, never `subPath`.
+`INFRA_CONFIG_FILE`'s path is baked into `docker/Dockerfile`
+(`/etc/parse-mqtt-to-influxdb3/infra.json`), mirroring `api`'s own `ENV
+INFLUXDB_CONFIG_FILE=/etc/api/influxdb.json` — a Kubernetes manifest should
+never set this env var itself, only mount the volume at that path.
 
 ## Decoder file layout
 

@@ -40,9 +40,18 @@ InfluxDB3 host/token and MQTT broker/credentials load from `infra.json`
 (`cmd/parse-mqtt-to-influxdb3/infra_config.go`), not env vars — mirrors the
 `api` repo's `influxdb.json`/`config.ts` pattern, minus the multi-org list
 (this service only ever has one InfluxDB host+token). Gitignored, holds a
-live token; see `infra.example.json` for the shape. Loaded once at startup,
-fails fast on a bad/missing file — no hot-reload, since the InfluxDB3/MQTT
-clients built from it are never swapped afterward.
+live token; see `infra.example.json` for the shape. Fails fast on a
+bad/missing file at startup. Polled every `INFRA_CONFIG_REFRESH_SEC`
+(default 30s); a change triggers a full graceful process restart (drain,
+flush, exit) rather than hot-swapping the live InfluxDB3/MQTT clients —
+safe in Kubernetes since the pod's restart policy brings it back up with
+the new config, but requires the volume mounted as a whole directory, never
+`subPath` (which never updates in place).
+
+`INFRA_CONFIG_FILE`'s path is baked into `docker/Dockerfile`
+(`/etc/parse-mqtt-to-influxdb3/infra.json`), same pattern as `api`'s own
+`ENV INFLUXDB_CONFIG_FILE=/etc/api/influxdb.json` — a Kubernetes manifest
+should never set this env var itself, only mount the volume at that path.
 
 ## File layout — one file per device codec
 
