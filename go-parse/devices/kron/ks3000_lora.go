@@ -54,21 +54,6 @@ func decodeKS3000Float(exp, f2, f1 byte) float64 {
 	return float64(math.Float32frombits(bits))
 }
 
-func decodeKS3000Timestamp(b []byte) time.Time {
-	b3, b4, b5, b6 := b[0], b[1], b[2], b[3]
-	sec := int(b3 & 0x3F)
-	min := int(b4&0x0F) | int((b3&0xC0)>>2)
-	hour := int((b4&0xF0)>>3) | int(b5&0x01)
-	day := int((b5 & 0x3E) >> 1)
-	mon := int((b5&0xC0)>>4) | int(b6&0x03)
-	year := 2000 + int((b6&0xFC)>>2)
-	if mon < 1 || mon > 12 || day < 1 || day > 31 {
-		log.Printf("[kron] ks3000 timestamp out of range (%d/%d/%d) - using now", day, mon, year)
-		return time.Now().UTC()
-	}
-	return time.Date(year, time.Month(mon), day, hour, min, sec, 0, time.UTC)
-}
-
 // DecodeKS3000LORA decodes KS3000 LoRa binary payloads.
 func DecodeKS3000LORA(payload []byte, deviceID, provider string, ts time.Time) []record.SensorDataRecord {
 	return decodeKS3000LORA(payload, deviceID, provider, ts)
@@ -81,10 +66,15 @@ func decodeKS3000LORA(payload []byte, deviceID, provider string, ts time.Time) [
 	}
 	const dm = "ks3000_lora"
 	i := 2
+	// Bytes here are the device's own onboard-clock timestamp, deliberately
+	// skipped rather than decoded: confirmed live against real traffic that
+	// this clock runs on Brazil local time (UTC-3) while every other decoder
+	// in this repo uses the LNS/gateway rx timestamp (already correct UTC,
+	// network-server-generated) passed in as ts — using this field instead
+	// previously wrote every ks3000_lora point ~3h behind true UTC.
 	if i < len(payload) && payload[i] > 0x73 {
 		i++
 		if i+4 <= len(payload) {
-			ts = decodeKS3000Timestamp(payload[i : i+4])
 			i += 4
 		} else {
 			log.Printf("[kron] DecodeKS3000LORA[%s]: truncated timestamp section", deviceID)
