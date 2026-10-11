@@ -38,9 +38,11 @@ connection loss) drains and flushes buffered points before exit.
 
 InfluxDB3 host/token and MQTT broker/credentials load from `infra.json`
 (`cmd/parse-mqtt-to-influxdb3/infra_config.go`), not env vars — mirrors the
-`api` repo's `influxdb.json`/`config.ts` pattern, minus the multi-org list
-(this service only ever has one InfluxDB host+token). Gitignored, holds a
-live token; see `infra.example.json` for the shape. Fails fast on a
+`api` repo's `influxdb.json`/`config.ts` pattern exactly, `influxdb.orgs`
+array included. This service only ever has one InfluxDB host+token pair, so
+it just picks the first `orgs` entry not disabled via `"allow": false` and
+ignores the rest. Gitignored, holds a live token; see `infra.example.json`
+for the shape. Fails fast on a
 bad/missing file at startup. Polled every `INFRA_CONFIG_REFRESH_SEC`
 (default 30s); a change triggers a full graceful process restart (drain,
 flush, exit) rather than hot-swapping the live InfluxDB3/MQTT clients —

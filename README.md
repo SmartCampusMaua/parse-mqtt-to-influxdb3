@@ -1085,21 +1085,24 @@ Response shape from `GET .../modbus-channels`:
 ## InfluxDB3 + MQTT connection config (`infra.json`)
 
 InfluxDB3 host/token and MQTT broker/credentials are no longer env vars —
-they live in a single JSON file, mirroring the SmartCampusMaua `api` repo's
-`influxdb.json` pattern (see that repo's `src/config.ts`):
+they live in a single JSON file, with `influxdb.orgs` matching the
+SmartCampusMaua `api` repo's `influxdb.json` format exactly (see that repo's
+`src/config.ts`), `allow` included:
 
 ```json
 {
   "version": "1",
-  "influxdb": { "host": "http://influxdb.maua.br:8181", "token": "..." },
+  "influxdb": { "orgs": [{ "org": "imt", "host": "http://influxdb.maua.br:8181", "token": "..." }] },
   "mqtt": { "broker": "mqtt.maua.br:1883", "username": "...", "password": "..." }
 }
 ```
 
-See `infra.example.json` for a template. Unlike `influxdb.json`'s `orgs`
-array in the `api` repo, this is a flat object — this service only ever
-talks to one InfluxDB host+token pair (shared across its four hardcoded
-databases), so there's no multi-tenant org list to select from.
+See `infra.example.json` for a template. This service only ever talks to
+one InfluxDB host+token pair (shared across its four hardcoded databases),
+so it picks the first entry in `orgs` not explicitly disabled via
+`"allow": false` and ignores the rest — there's no runtime org selection
+the way `api` has (by request header/param), just whichever org is first
+and enabled in the file.
 
 Loaded at startup (`cmd/parse-mqtt-to-influxdb3/infra_config.go`), failing
 fast on a missing/invalid file — same "crash at boot rather than run with an

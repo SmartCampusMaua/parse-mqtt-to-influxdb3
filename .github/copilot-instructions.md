@@ -43,10 +43,11 @@ sensors/Modbus-channels come from that same API's `/assets`, `/sensors`, and
 
 InfluxDB3 host/token and MQTT broker/credentials load from `infra.json`
 (`cmd/parse-mqtt-to-influxdb3/infra_config.go`), mirroring the SmartCampusMaua
-`api` repo's `influxdb.json`/`config.ts` pattern — a flat object (no
-multi-org list; this service only ever has one InfluxDB host+token), failing
-fast on a missing/invalid file at startup. Gitignored, holds a live token —
-see `infra.example.json` for the shape. Polled every
+`api` repo's `influxdb.json`/`config.ts` pattern exactly, `influxdb.orgs`
+array included — this service only ever has one InfluxDB host+token pair,
+so it just picks the first `orgs` entry not disabled via `"allow": false`
+and ignores the rest. Fails fast on a missing/invalid file at startup.
+Gitignored, holds a live token — see `infra.example.json` for the shape. Polled every
 `INFRA_CONFIG_REFRESH_SEC` (default 30s); a change triggers a full graceful
 restart (drain, flush, exit) rather than hot-swapping the live InfluxDB3/MQTT
 clients — requires the volume mounted as a whole directory, never `subPath`.

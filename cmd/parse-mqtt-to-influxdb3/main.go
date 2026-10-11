@@ -1235,7 +1235,7 @@ func main() {
 	}
 
 	defer clients.Close()
-	log.Printf("InfluxDB3: host=%s databases=[iot_sensors, audit_iot, vehicle_telemetry, audit_vehicle] (all on same host+token)", INFLUXDB_HOST)
+	log.Printf("InfluxDB3: org=%s host=%s databases=[iot_sensors, audit_iot, vehicle_telemetry, audit_vehicle] (all on same host+token)", infraCfg.InfluxDB.Org, INFLUXDB_HOST)
 
 	// Exactly one goroutine each ever calls WritePoints against iot_sensors /
 	// audit_iot from here on — see batchWriter's doc comment for why (every
